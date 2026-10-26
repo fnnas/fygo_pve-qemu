@@ -21,6 +21,9 @@ ifeq ($(shell test -f "$(SRCDIR)/configure" && echo 1 || echo 0), 0)
 	git submodule update --init --recursive
 	cd $(SRCDIR); meson subprojects download
 endif
+ifeq ($(shell test -f "$(SRCDIR)/roms/seabios/src/boot.c" && echo 1 || echo 0), 0)
+	git -C $(SRCDIR) submodule update --init roms/seabios
+endif
 
 PC_BIOS_FW_PURGE_LIST_IN = \
 	hppa-firmware.img \

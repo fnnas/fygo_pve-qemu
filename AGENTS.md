@@ -24,6 +24,7 @@ individual features in their patches, tests, and relevant product documentation.
   `series`. Include regression tests in the patch set. Changes left only in a
   prepared build tree will be lost; changes left only in the submodule are not
   included in the packaging repository's commit.
+- Number repository-specific patches from `9000`; preserve upstream numbering.
 - Update pinned submodule revisions as part of intended upstream updates, not
   as a workaround for patch failures. Verify the complete patch sequence applies.
 - Follow surrounding QEMU C and Perl conventions. Run QEMU's

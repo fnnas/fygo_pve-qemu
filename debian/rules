@@ -94,6 +94,9 @@ build-stamp: ${BUILDDIR}/config.status
 	dh_testdir
 
 	# Add here commands to compile the package.
+	# Match the namespace paths emitted by QEMU in the bundled PC BIOS.
+	$(MAKE) -C roms build-seabios-config-seabios-256k PYTHON=python3
+	cp roms/seabios/builds/seabios-256k/bios.bin pc-bios/bios-256k.bin
 	$(MAKE)
 
 	#docbook-to-man debian/kvm.sgml > kvm.1
