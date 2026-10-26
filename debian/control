@@ -3,7 +3,9 @@ Section: admin
 Priority: optional
 Maintainer: Proxmox Support Team <support@proxmox.com>
 Build-Depends: debhelper-compat (= 13),
+               acpica-tools,
                check,
+               gcc-x86-64-linux-gnu [!amd64 !i386],
                libacl1-dev,
                libaio-dev,
                libasound2-dev,

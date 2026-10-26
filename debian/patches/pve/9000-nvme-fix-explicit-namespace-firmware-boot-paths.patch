@@ -1,0 +1,293 @@
+Description: fix explicit NVMe namespace firmware boot paths
+ Namespace realization moves devices from the PCI controller to the subsystem
+ bus. Bind bootindex to the original controller and the assigned NSID after
+ realization, including shared namespaces, and remove or reroute those entries
+ when their namespace or controller disappears. Keep QOM updates bound to the
+ same path. Exercise reset, removal, automatic IDs, private/shared namespaces
+ and multiple paths in the firmware boot-order qtest. Encode NSIDs in hex,
+ as required for matching UEFI device paths. Clear the subsystem namespace
+ slot on removal so reusing an NSID does not retain a freed namespace.
+Forwarded: no
+
+--- a/hw/nvme/ctrl.c
++++ b/hw/nvme/ctrl.c
+@@ -9357,6 +9357,26 @@ static void nvme_exit(PCIDevice *pci_dev
+ 
+     nvme_subsys_unregister_ctrl(n->subsys, n);
+ 
++    /* Drop paths through this controller before its PCI device disappears. */
++    for (i = 1; i <= NVME_MAX_NAMESPACES; i++) {
++        NvmeCtrl *replacement = NULL;
++        ns = nvme_subsys_ns(n->subsys, i);
++        if (!ns || ns->boot_ctrl != n) {
++            continue;
++        }
++        if (ns->params.shared) {
++            for (int j = 0; j < ARRAY_SIZE(n->subsys->ctrls); j++) {
++                NvmeCtrl *ctrl = nvme_subsys_ctrl(n->subsys, j);
++                if (ctrl && !pci_is_vf(&ctrl->parent_obj) &&
++                    (i != 1 || ctrl->namespace.blkconf.bootindex < 0)) {
++                    replacement = ctrl;
++                    break;
++                }
++            }
++        }
++        nvme_ns_set_boot_controller(ns, replacement);
++    }
++
+     g_free(n->cq);
+     g_free(n->sq);
+     g_free(n->aer_reqs);
+--- a/hw/nvme/ns.c
++++ b/hw/nvme/ns.c
+@@ -716,13 +716,46 @@ void nvme_ns_cleanup(NvmeNamespace *ns)
+     }
+ }
+ 
++/*
++ * Namespaces are reparented to the subsystem bus during realization. Their
++ * firmware boot paths must still identify a PCI controller and the final NSID.
++ * Keep the bootindex property bound to that controller as well, so subsequent
++ * QOM changes and property release update the same entry.
++ */
++void nvme_ns_set_boot_controller(NvmeNamespace *ns, NvmeCtrl *n)
++{
++    int32_t bootindex = ns->bootindex;
++
++    object_property_del(OBJECT(ns), "bootindex");
++    ns->boot_ctrl = n;
++    snprintf(ns->bootindex_suffix, sizeof(ns->bootindex_suffix),
++             "/namespace@%" PRIx32 ",0", ns->params.nsid);
++    device_add_bootindex_property(OBJECT(ns), &ns->bootindex, "bootindex",
++                                 ns->bootindex_suffix,
++                                 n ? DEVICE(n) : DEVICE(ns));
++
++    /* Preserve the setting without advertising a missing controller. */
++    ns->bootindex = bootindex;
++    if (n && !ns->params.detached) {
++        add_boot_device_path(bootindex, DEVICE(n), ns->bootindex_suffix);
++    }
++}
++
+ static void nvme_ns_unrealize(DeviceState *dev)
+ {
+     NvmeNamespace *ns = NVME_NS(dev);
++    NvmeSubsystem *subsys = ns->subsys;
++    uint32_t nsid = ns->params.nsid;
+ 
+     nvme_ns_drain(ns);
+     nvme_ns_shutdown(ns);
+     nvme_ns_cleanup(ns);
++    nvme_ns_set_boot_controller(ns, NULL);
++
++    /* Symmetric with nvme_ns_realize() which sets subsys->namespaces[nsid]. */
++    if (subsys && nsid && subsys->namespaces[nsid] == ns) {
++        subsys->namespaces[nsid] = NULL;
++    }
+ }
+ 
+ void nvme_ns_atomic_configure_boundary(bool dn, uint16_t nabsn,
+@@ -876,7 +909,17 @@ static void nvme_ns_realize(DeviceState
+         return;
+     }
+ 
++    /* A controller bootindex already names namespace 1 on this path. */
++    if (nsid == 1 && n->namespace.blkconf.bootindex >= 0 &&
++        ns->bootindex >= 0) {
++        error_setg(errp, "set bootindex on the namespace, not its controller");
++        return;
++    }
++
+     subsys->namespaces[nsid] = ns;
++    if (nsid != 1 || n->namespace.blkconf.bootindex < 0) {
++        nvme_ns_set_boot_controller(ns, n);
++    }
+ 
+     ns->id_ns.endgid = cpu_to_le16(0x1);
+     ns->id_ns_ind.endgrpid = cpu_to_le16(0x1);
+@@ -945,7 +988,7 @@ static void nvme_ns_instance_init(Object
+ {
+     NvmeNamespace *ns = NVME_NS(obj);
+ 
+-    sprintf(ns->bootindex_suffix, "/namespace@%" PRIu32 ",0", ns->params.nsid);
++    sprintf(ns->bootindex_suffix, "/namespace@%" PRIx32 ",0", ns->params.nsid);
+ 
+     device_add_bootindex_property(obj, &ns->bootindex, "bootindex",
+                                   ns->bootindex_suffix, DEVICE(obj));
+--- a/hw/nvme/nvme.h
++++ b/hw/nvme/nvme.h
+@@ -247,6 +247,7 @@ typedef struct NvmeNamespace {
+     BlockConf    blkconf;
+     int32_t      bootindex;
+     char         bootindex_suffix[24];
++    NvmeCtrl     *boot_ctrl;
+     int64_t      size;
+     int64_t      moff;
+     NvmeIdNs     id_ns;
+@@ -414,6 +415,7 @@ int nvme_ns_setup(NvmeNamespace *ns, Err
+ void nvme_ns_drain(NvmeNamespace *ns);
+ void nvme_ns_shutdown(NvmeNamespace *ns);
+ void nvme_ns_cleanup(NvmeNamespace *ns);
++void nvme_ns_set_boot_controller(NvmeNamespace *ns, NvmeCtrl *n);
+ 
+ typedef struct NvmeAsyncEvent {
+     QTAILQ_ENTRY(NvmeAsyncEvent) entry;
+--- a/tests/qtest/boot-order-test.c
++++ b/tests/qtest/boot-order-test.c
+@@ -12,6 +12,7 @@
+ 
+ #include "qemu/osdep.h"
+ #include "libqos/fw_cfg.h"
++#include "libqos/pci.h"
+ #include "libqtest.h"
+ #include "qobject/qdict.h"
+ #include "standard-headers/linux/qemu_fw_cfg.h"
+@@ -60,6 +61,129 @@ static void test_boot_orders(const char
+     }
+ }
+ 
++typedef struct {
++    const char *name;
++    const char *args;
++    const char *expected;
++} NvmeBootPathTest;
++
++#define NVME_BOOT_CTRL "/pci@i0cf8/pci1b36,0010@4"
++#define NVME_BOOT_ARGS "-device nvme-subsys,id=ss " \
++    "-device nvme,id=ctrl,subsys=ss,serial=boot,addr=04,use-intel-id=off "
++
++static void assert_nvme_boot_path(QTestState *qts, const char *expected)
++{
++    g_autoptr(QFWCFG) fw_cfg = io_fw_cfg_init(qts, 0x510);
++    g_autofree char *expected_path = g_strdup(expected);
++    char order[1024] = { 0 };
++    size_t size = qfw_cfg_get_file(fw_cfg, "bootorder", order, sizeof(order));
++
++    g_assert_cmpuint(size, <=, sizeof(order));
++    g_strchomp(order);
++    g_strchomp(expected_path);
++    g_assert_cmpstr(order, ==, expected_path);
++}
++
++static void test_nvme_boot_path(const void *opaque)
++{
++    const NvmeBootPathTest *test = opaque;
++    QTestState *qts = qtest_initf(
++        "-M q35 -nodefaults -blockdev driver=null-co,node-name=disk,size=16777216 %s",
++        test->args);
++
++    assert_nvme_boot_path(qts, test->expected);
++    qtest_system_reset(qts);
++    assert_nvme_boot_path(qts, test->expected);
++    qtest_quit(qts);
++}
++
++static const NvmeBootPathTest nvme_boot_path_tests[] = {
++    { "legacy",
++      "-device nvme,drive=disk,serial=boot,addr=04,use-intel-id=off,bootindex=1",
++      NVME_BOOT_CTRL "/namespace@1,0\n" },
++    { "controller-index",
++      "-device nvme-subsys,id=ss "
++      "-device nvme,id=ctrl,subsys=ss,serial=boot,addr=04,"
++      "use-intel-id=off,bootindex=1 "
++      "-device nvme-ns,id=ns,bus=ctrl,drive=disk,nsid=1",
++      NVME_BOOT_CTRL "/namespace@1,0\n" },
++    { "shared", NVME_BOOT_ARGS
++      "-device nvme-ns,id=ns,bus=ctrl,drive=disk,nsid=10,bootindex=1",
++      NVME_BOOT_CTRL "/namespace@a,0\n" },
++    { "private", NVME_BOOT_ARGS
++      "-device nvme-ns,id=ns,bus=ctrl,drive=disk,nsid=256,shared=off,bootindex=1",
++      NVME_BOOT_CTRL "/namespace@100,0\n" },
++    { "automatic-nsid", NVME_BOOT_ARGS
++      "-device nvme-ns,id=ns,bus=ctrl,drive=disk,bootindex=1",
++      NVME_BOOT_CTRL "/namespace@1,0\n" },
++    { "multipath", NVME_BOOT_ARGS
++      "-device nvme,id=path1,subsys=ss,serial=boot,addr=05,use-intel-id=off "
++      "-device nvme-ns,id=ns,bus=path1,drive=disk,nsid=10,bootindex=1",
++      "/pci@i0cf8/pci1b36,0010@5/namespace@a,0\n" },
++    { "detached", NVME_BOOT_ARGS
++      "-device nvme-ns,id=ns,bus=ctrl,drive=disk,nsid=10,detached=on,bootindex=1",
++      "" },
++    { "multiple-namespaces", NVME_BOOT_ARGS
++      "-blockdev driver=null-co,node-name=disk2,size=16777216 "
++      "-device nvme-ns,id=ns1,bus=ctrl,drive=disk,nsid=2,bootindex=2 "
++      "-device nvme-ns,id=ns2,bus=ctrl,drive=disk2,nsid=10,bootindex=1",
++      NVME_BOOT_CTRL "/namespace@a,0\n"
++      NVME_BOOT_CTRL "/namespace@2,0\n" },
++};
++
++static void test_nvme_boot_path_updates(void)
++{
++    QTestState *qts = qtest_init(
++        "-M q35 -nodefaults " NVME_BOOT_ARGS
++        "-blockdev driver=null-co,node-name=disk,size=16777216 "
++        "-device nvme-ns,id=ns,bus=ctrl,drive=disk,nsid=10,bootindex=1");
++
++    qtest_qmp_assert_success(qts,
++        "{ 'execute': 'qom-set', 'arguments': { 'path': '/machine/peripheral/ns',"
++        " 'property': 'bootindex', 'value': 3 } }");
++    qtest_system_reset(qts);
++    assert_nvme_boot_path(qts, NVME_BOOT_CTRL "/namespace@a,0\n");
++
++    qtest_qmp_assert_success(qts,
++        "{ 'execute': 'qom-set', 'arguments': { 'path': '/machine/peripheral/ns',"
++        " 'property': 'bootindex', 'value': -1 } }");
++    qtest_system_reset(qts);
++    assert_nvme_boot_path(qts, "");
++
++    qtest_qmp_assert_success(qts,
++        "{ 'execute': 'qom-set', 'arguments': { 'path': '/machine/peripheral/ns',"
++        " 'property': 'bootindex', 'value': 1 } }");
++    qtest_system_reset(qts);
++    assert_nvme_boot_path(qts, NVME_BOOT_CTRL "/namespace@a,0\n");
++
++    /* QEMU 11.0 has no namespace hotplug; exercise its unrealize hook. */
++    qtest_qmp_assert_success(qts,
++        "{ 'execute': 'qom-set', 'arguments': { 'path': '/machine/peripheral/ns',"
++        " 'property': 'realized', 'value': false } }");
++    qtest_system_reset(qts);
++    assert_nvme_boot_path(qts, "");
++
++    qtest_quit(qts);
++}
++
++static void test_nvme_boot_path_controller_removal(void)
++{
++    QTestState *qts = qtest_init(
++        "-M pc -nodefaults " NVME_BOOT_ARGS
++        "-device nvme,id=path1,subsys=ss,serial=boot,addr=05,use-intel-id=off "
++        "-blockdev driver=null-co,node-name=disk,size=16777216 "
++        "-device nvme-ns,id=ns,bus=ctrl,drive=disk,nsid=10,bootindex=1");
++
++    qpci_unplug_acpi_device_test(qts, "ctrl", 4);
++    qtest_system_reset(qts);
++    assert_nvme_boot_path(qts, "/pci@i0cf8/pci1b36,0010@5/namespace@a,0\n");
++
++    qpci_unplug_acpi_device_test(qts, "path1", 5);
++    qtest_system_reset(qts);
++    assert_nvme_boot_path(qts, "");
++    qtest_quit(qts);
++}
++
+ static uint8_t read_mc146818(QTestState *qts, uint16_t port, uint8_t reg)
+ {
+     qtest_outb(qts, port, reg);
+@@ -162,6 +286,18 @@ int main(int argc, char *argv[])
+ 
+     if (strcmp(arch, "i386") == 0 || strcmp(arch, "x86_64") == 0) {
+         qtest_add_func("boot-order/pc", test_pc_boot_order);
++        if (qtest_has_machine("q35") && qtest_has_device("nvme")) {
++            for (size_t i = 0; i < G_N_ELEMENTS(nvme_boot_path_tests); i++) {
++                const NvmeBootPathTest *test = &nvme_boot_path_tests[i];
++                g_autofree char *name = g_strdup_printf("boot-order/nvme/%s",
++                                                       test->name);
++                qtest_add_data_func(name, test, test_nvme_boot_path);
++            }
++            qtest_add_func("boot-order/nvme/updates",
++                           test_nvme_boot_path_updates);
++            qtest_add_func("boot-order/nvme/controller-removal",
++                           test_nvme_boot_path_controller_removal);
++        }
+     } else if (strcmp(arch, "ppc") == 0 || strcmp(arch, "ppc64") == 0) {
+         qtest_add_func("boot-order/pmac_oldworld",
+                        test_pmac_oldworld_boot_order);

@@ -1,0 +1,110 @@
+Description: migrate the PCI configuration of SDHCI controllers
+ Save the PCI command register and BAR mappings along with the existing SDHCI
+ controller state. Otherwise a restored guest reads zero from the unmapped BAR
+ and loses its eMMC device on the first I/O. Preserve the original controller
+ layout when loading version 1 and append the missing PCI state in version 2.
+ Add a migration regression that checks PCI configuration and controller MMIO
+ without remapping or enabling the controller at the destination.
+Forwarded: no
+
+--- a/hw/sd/sdhci-pci.c
++++ b/hw/sd/sdhci-pci.c
+@@ -18,11 +18,29 @@
+ #include "qemu/osdep.h"
+ #include "qapi/error.h"
+ #include "qemu/module.h"
++#include "migration/vmstate.h"
+ #include "hw/core/irq.h"
+ #include "hw/core/qdev-properties.h"
+ #include "hw/sd/sdhci.h"
+ #include "sdhci-internal.h"
+ 
++/* Keep the original controller stream and append PCI state in version 2. */
++static const VMStateDescription sdhci_pci_vmstate = {
++    .name = "sdhci",
++    .version_id = 2,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        {
++            .name = "controller",
++            .size = sizeof(SDHCIState),
++            .flags = VMS_STRUCT,
++            .vmsd = &sdhci_vmstate,
++        },
++        VMSTATE_STRUCT(pcidev, SDHCIState, 2, vmstate_pci_device, PCIDevice),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
+ static const Property sdhci_pci_properties[] = {
+     DEFINE_SDHCI_COMMON_PROPERTIES(SDHCIState),
+ };
+@@ -67,6 +85,7 @@ static void sdhci_pci_class_init(ObjectC
+     device_class_set_props(dc, sdhci_pci_properties);
+ 
+     sdhci_common_class_init(klass, data);
++    dc->vmsd = &sdhci_pci_vmstate;
+ }
+ 
+ static const TypeInfo sdhci_pci_types[] = {
+--- a/tests/qtest/sdhci-test.c
++++ b/tests/qtest/sdhci-test.c
+@@ -103,9 +103,58 @@ static void test_registers(void *obj, vo
+     check_capab_baseclock(s, s->props.baseclock);
+ }
+ 
++static void test_pci_migrate(void *obj, void *data, QGuestAllocator *alloc)
++{
++    QSDHCI_PCI *src = obj;
++    QPCIDevice *pdev = &src->dev;
++    QTestState *from = pdev->bus->qts;
++    g_autofree char *tmpdir = g_dir_make_tmp("sdhci-test-XXXXXX", NULL);
++    g_autofree char *path = g_strdup_printf("%s/migrate", tmpdir);
++    g_autofree char *uri = g_strdup_printf("unix:%s", path);
++    g_autoptr(GString) cmdline = g_string_new(qos_get_current_command_line());
++    uint32_t bar = qpci_config_readl(pdev, PCI_BASE_ADDRESS_0);
++    uint16_t command = qpci_config_readw(pdev, PCI_COMMAND);
++    QTestState *to;
++    QGuestAllocator *dest_alloc;
++    QSDHCI_PCI *dest_sdhci;
++    QPCIDevice *dest;
++
++    g_assert_nonnull(tmpdir);
++    g_assert_cmphex(bar, !=, 0);
++    qpci_config_writeb(pdev, PCI_CACHE_LINE_SIZE, 0x10);
++    qpci_io_writeb(pdev, src->mem_bar, 0x28, 0x02);
++    g_assert_cmphex(qpci_io_readb(pdev, src->mem_bar, 0x28), ==, 0x02);
++
++    g_string_append_printf(cmdline, " -incoming %s", uri);
++    to = qtest_init(cmdline->str);
++    dest_sdhci = qos_allocate_objects(to, &dest_alloc);
++    dest = &dest_sdhci->dev;
++    /* Seed different PCI state so graph setup cannot hide a migration bug. */
++    qpci_config_writew(dest, PCI_COMMAND, 0);
++    qpci_config_writel(dest, PCI_BASE_ADDRESS_0, 0);
++    qpci_config_writeb(dest, PCI_CACHE_LINE_SIZE, 0);
++    qtest_qmp_assert_success(from,
++        "{'execute':'migrate','arguments':{'uri':%s}}", uri);
++    qtest_qmp_eventwait(from, "STOP");
++    qtest_qmp_eventwait(to, "RESUME");
++
++    /* Do not enable or remap the destination: migration must restore both. */
++    g_assert_cmphex(qpci_config_readl(dest, PCI_BASE_ADDRESS_0), ==, bar);
++    g_assert_cmphex(qpci_config_readw(dest, PCI_COMMAND), ==, command);
++    g_assert_cmphex(qpci_config_readb(dest, PCI_CACHE_LINE_SIZE), ==, 0x10);
++    g_assert_cmphex(qpci_io_readb(dest, src->mem_bar, 0x28), ==, 0x02);
++    g_assert_cmphex(qpci_io_readw(dest, src->mem_bar, SDHC_HCVER), ==,
++                   src->sdhci.readw(&src->sdhci, SDHC_HCVER));
++
++    qtest_quit(to);
++    g_unlink(path);
++    g_rmdir(tmpdir);
++}
++
+ static void register_sdhci_test(void)
+ {
+     qos_add_test("registers", "sdhci", test_registers, NULL);
++    qos_add_test("migrate", "sdhci-pci", test_pci_migrate, NULL);
+ }
+ 
+ libqos_init(register_sdhci_test);

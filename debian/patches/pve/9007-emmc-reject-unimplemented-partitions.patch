@@ -1,0 +1,57 @@
+Description: reject unimplemented eMMC general purpose partitions
+ Reject GP1 through GP4 in PARTITION_CONFIG before changing the active
+ partition. These partitions are not implemented and selecting them otherwise
+ reaches an assertion in sd_part_offset on the next read or write.
+ Add a regression checking all four selections fail with SWITCH_ERROR and
+ preserve the selected USER partition and its data.
+Forwarded: no
+
+--- a/hw/sd/sd.c
++++ b/hw/sd/sd.c
+@@ -1480,7 +1480,8 @@ static void emmc_function_switch(SDState
+     if (index == EXT_CSD_PART_CONFIG) {
+         uint8_t part = b & EXT_CSD_PART_CONFIG_ACC_MASK;
+ 
+-        if (((part == EXT_CSD_PART_CONFIG_ACC_BOOT1 ||
++        if (part > EXT_CSD_PART_CONFIG_ACC_RPMB ||
++            ((part == EXT_CSD_PART_CONFIG_ACC_BOOT1 ||
+               part == EXT_CSD_PART_CONFIG_ACC_BOOT2) && !sd->boot_part_size) ||
+             (part == EXT_CSD_PART_CONFIG_ACC_RPMB && !sd->rpmb_part_size)) {
+             qemu_log_mask(LOG_GUEST_ERROR,
+--- a/tests/qtest/emmc-test.c
++++ b/tests/qtest/emmc-test.c
+@@ -329,6 +329,27 @@ static void test_combined_reset(void)
+     emmc_cleanup(&s);
+ }
+ 
++static void test_unsupported_partition(void)
++{
++    EMMCTest s = {};
++    uint8_t frame[FRAME_SIZE];
++    uint32_t status;
++
++    emmc_init(&s);
++    for (unsigned part = 4; part <= 7; part++) {
++        status = emmc_command(&s, 6, 0x03b30000 | (part << 8),
++                              false, 0, false);
++        qtest_clock_step(s.qts, 1000000);
++        emmc_command(&s, 17, 0, true, 1, true);
++        emmc_fifo(&s, frame, true);
++        g_assert_cmphex(status & (1U << 7), !=, 0);
++        for (unsigned i = 0; i < FRAME_SIZE; i++) {
++            g_assert_cmphex(frame[i], ==, 0x5a);
++        }
++    }
++    emmc_cleanup(&s);
++}
++
+ int main(int argc, char **argv)
+ {
+     g_test_init(&argc, &argv, NULL);
+@@ -338,5 +359,6 @@ int main(int argc, char **argv)
+     qtest_add_func("emmc/boot-bounds", test_boot_bounds);
+     qtest_add_func("emmc/rpmb-requires-frames", test_rpmb_requires_frames);
+     qtest_add_func("emmc/combined-reset", test_combined_reset);
++    qtest_add_func("emmc/unsupported-partition", test_unsupported_partition);
+     return g_test_run();
+ }

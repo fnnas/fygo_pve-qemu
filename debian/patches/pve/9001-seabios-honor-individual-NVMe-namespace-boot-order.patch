@@ -1,0 +1,51 @@
+Description: honor individual NVMe namespace boot priorities in SeaBIOS
+ Matching only the controller PCI path assigns every namespace the priority
+ of the first boot entry on that controller. Include the actual namespace ID
+ in hexadecimal, matching QEMU firmware paths and the UEFI representation.
+Forwarded: no
+
+--- a/roms/seabios/src/boot.c
++++ b/roms/seabios/src/boot.c
+@@ -316,6 +316,20 @@ int bootprio_find_pci_device(struct pci_
+     return find_prio(desc);
+ }
+ 
++int bootprio_find_nvme_device(struct pci_device *pci, u32 nsid)
++{
++    if (CONFIG_CSM) {
++        return csm_bootprio_pci(pci);
++    }
++    if (!CONFIG_BOOTORDER) {
++        return -1;
++    }
++    char desc[256];
++    char *p = build_pci_path(desc, sizeof(desc), "*", pci);
++    snprintf(p, desc + sizeof(desc) - p, "/namespace@%x,0", nsid);
++    return find_prio(desc);
++}
++
+ int bootprio_find_mmio_device(void *mmio)
+ {
+     if (!CONFIG_BOOTORDER)
+--- a/roms/seabios/src/hw/nvme.c
++++ b/roms/seabios/src/hw/nvme.c
+@@ -311,7 +311,8 @@ nvme_probe_ns(struct nvme_ctrl *ctrl, u3
+                           ns->lba_count, ns->block_size, ns->metadata_size);
+ 
+     dprintf(3, "%s\n", desc);
+-    boot_add_hd(&ns->drive, desc, bootprio_find_pci_device(ctrl->pci));
++    boot_add_hd(&ns->drive, desc,
++                bootprio_find_nvme_device(ctrl->pci, ns_id));
+ 
+ free_buffer:
+     free (id);
+--- a/roms/seabios/src/util.h
++++ b/roms/seabios/src/util.h
+@@ -30,6 +30,7 @@ void bcv_prepboot(void);
+ u8 is_bootprio_strict(void);
+ struct pci_device;
+ int bootprio_find_pci_device(struct pci_device *pci);
++int bootprio_find_nvme_device(struct pci_device *pci, u32 nsid);
+ int bootprio_find_mmio_device(void *mmio);
+ int bootprio_find_scsi_device(struct pci_device *pci, int target, int lun);
+ int bootprio_find_scsi_mmio_device(void *mmio, int target, int lun);

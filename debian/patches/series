@@ -80,3 +80,11 @@ pve/0047-pbs-restore-add-no-cache-flag-to-skip-host-page-cach.patch
 pve/0048-PVE-backup-vma-reader-reject-zero-length-name-blobs.patch
 pve/0049-PVE-backup-vma-reader-fix-blob-buffer-bounds-check-w.patch
 pve/0050-PVE-backup-vma-reader-restrict-allowed-archive-membe.patch
+pve/9000-nvme-fix-explicit-namespace-firmware-boot-paths.patch
+pve/9001-seabios-honor-individual-NVMe-namespace-boot-order.patch
+pve/9002-nvme-preserve-unwritten-PI-after-discard.patch
+pve/9003-sdhci-pci-migrate-PCI-configuration.patch
+pve/9004-seabios-skip-unsupported-NVMe-metadata.patch
+pve/9005-emmc-enforce-partition-access-boundaries.patch
+pve/9006-sdhci-honor-combined-software-reset-bits.patch
+pve/9007-emmc-reject-unimplemented-partitions.patch
