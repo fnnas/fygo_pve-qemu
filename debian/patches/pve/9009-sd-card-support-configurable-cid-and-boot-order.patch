@@ -1,0 +1,458 @@
+Description: add configurable SD card identity and PCI SDHCI boot priority
+ Expose an optional SD card CID while preserving the default identities, card
+ protocol and migration state. Add per-controller bootindex for firmware boot
+ ordering without changing the default response format. Cover card identity,
+ capacity boundaries, I/O, reset and invalid configuration with native qtests.
+ Document the card model, capacity limits and firmware compatibility.
+Forwarded: no
+
+--- a/hw/sd/sd.c
++++ b/hw/sd/sd.c
+@@ -461,8 +461,25 @@
+ #define MDT_YR  2006
+ #define MDT_MON 2
+ 
++static bool sd_set_configured_cid(SDState *sd)
++{
++    if (!sd->cid_config) {
++        return false;
++    }
++    /* Validated before realize; restore the configured CID on reset. */
++    for (unsigned i = 0; i < sizeof(sd->cid); i++) {
++        sd->cid[i] = (g_ascii_xdigit_value(sd->cid_config[2 * i]) << 4) |
++                     g_ascii_xdigit_value(sd->cid_config[2 * i + 1]);
++    }
++    return true;
++}
++
+ static void sd_set_cid(SDState *sd)
+ {
++    if (sd_set_configured_cid(sd)) {
++        return;
++    }
++
+     sd->cid[0] = MID;       /* Fake card manufacturer ID (MID) */
+     sd->cid[1] = OID[0];    /* OEM/Application ID (OID) */
+     sd->cid[2] = OID[1];
+@@ -481,12 +498,7 @@
+ 
+ static void emmc_set_cid(SDState *sd)
+ {
+-    if (sd->cid_config) {
+-        /* Validated before realize; restore the configured CID on reset. */
+-        for (unsigned i = 0; i < sizeof(sd->cid); i++) {
+-            sd->cid[i] = (g_ascii_xdigit_value(sd->cid_config[2 * i]) << 4) |
+-                         g_ascii_xdigit_value(sd->cid_config[2 * i + 1]);
+-        }
++    if (sd_set_configured_cid(sd)) {
+         return;
+     }
+ 
+@@ -3148,6 +3160,20 @@
+     int64_t blk_size = -ENOMEDIUM;
+     int ret;
+ 
++    if (sd->cid_config) {
++        bool valid = strlen(sd->cid_config) == 2 * sizeof(sd->cid);
++
++        for (unsigned i = 0; valid && i < 2 * sizeof(sd->cid); i++) {
++            valid = g_ascii_isxdigit(sd->cid_config[i]);
++        }
++        if (!valid) {
++            error_setg(errp, "%s cid must contain exactly 32 "
++                       "hexadecimal characters",
++                       sd_is_emmc(sd) ? "eMMC" : "SD card");
++            return;
++        }
++    }
++
+     switch (sd->spec_version) {
+     case SD_PHY_SPECv2_00_VERS
+      ... SD_PHY_SPECv3_01_VERS:
+@@ -3223,21 +3249,6 @@
+ {
+     SDState *sd = SDMMC_COMMON(dev);
+ 
+-    if (sd->cid_config) {
+-        if (strlen(sd->cid_config) != 2 * sizeof(sd->cid)) {
+-            error_setg(errp,
+-                       "eMMC cid must contain exactly 32 hexadecimal characters");
+-            return;
+-        }
+-        for (unsigned i = 0; i < 2 * sizeof(sd->cid); i++) {
+-            if (!g_ascii_isxdigit(sd->cid_config[i])) {
+-                error_setg(errp,
+-                           "eMMC cid must contain exactly 32 hexadecimal characters");
+-                return;
+-            }
+-        }
+-    }
+-
+     sd->spec_version = SD_PHY_SPECv3_01_VERS; /* Actually v4.5 */
+ 
+     sd_realize(dev, errp);
+@@ -3248,6 +3259,7 @@
+ };
+ 
+ static const Property sd_properties[] = {
++    DEFINE_PROP_STRING("cid", SDState, cid_config),
+     DEFINE_PROP_UINT8("spec_version", SDState,
+                       spec_version, SD_PHY_SPECv3_01_VERS),
+ };
+--- a/hw/sd/sdhci-pci.c
++++ b/hw/sd/sdhci-pci.c
+@@ -18,6 +18,7 @@
+ #include "qemu/osdep.h"
+ #include "qapi/error.h"
+ #include "qemu/module.h"
++#include "system/system.h"
+ #include "migration/vmstate.h"
+ #include "hw/core/irq.h"
+ #include "hw/core/qdev-properties.h"
+@@ -72,6 +73,14 @@
+     sdhci_uninitfn(s);
+ }
+ 
++static void sdhci_pci_instance_init(Object *obj)
++{
++    SDHCIState *s = PCI_SDHCI(obj);
++
++    device_add_bootindex_property(obj, &s->bootindex, "bootindex", NULL,
++                                 DEVICE(obj));
++}
++
+ static void sdhci_pci_class_init(ObjectClass *klass, const void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(klass);
+@@ -94,6 +103,7 @@
+         .parent         = TYPE_PCI_DEVICE,
+         .instance_size  = sizeof(SDHCIState),
+         .class_init     = sdhci_pci_class_init,
++        .instance_init  = sdhci_pci_instance_init,
+         .interfaces     = (const InterfaceInfo[]) {
+             { INTERFACE_CONVENTIONAL_PCI_DEVICE },
+             { },
+--- a/include/hw/sd/sdhci.h
++++ b/include/hw/sd/sdhci.h
+@@ -94,6 +94,7 @@
+     /* RO Host Controller Version Register always reads as 0x2401 */
+ 
+     /* Configurable properties */
++    int32_t bootindex;
+     bool pending_insert_quirk; /* Quirk for Raspberry Pi card insert int */
+     uint32_t quirks;
+     uint8_t sd_spec_version;
+--- a/tests/qtest/meson.build
++++ b/tests/qtest/meson.build
+@@ -93,7 +93,7 @@
+   (config_all_devices.has_key('CONFIG_VIRTIO_BALLOON') ? ['virtio-balloon-test'] : []) + \
+   (config_all_devices.has_key('CONFIG_Q35') ? ['q35-test'] : []) +                          \
+   (config_all_devices.has_key('CONFIG_SB16') ? ['fuzz-sb16-test'] : []) +                   \
+-  (config_all_devices.has_key('CONFIG_SDHCI_PCI') ? ['fuzz-sdcard-test', 'emmc-test'] : []) +            \
++  (config_all_devices.has_key('CONFIG_SDHCI_PCI') ? ['fuzz-sdcard-test', 'emmc-test', 'sdcard-test'] : []) +            \
+   (config_all_devices.has_key('CONFIG_ESP_PCI') ? ['am53c974-test'] : []) +                 \
+   (config_all_devices.has_key('CONFIG_AMD_IOMMU') ? ['amd-iommu-test'] : []) +             \
+   (config_all_devices.has_key('CONFIG_VTD') ? ['intel-iommu-test'] : []) +                 \
+--- /dev/null
++++ b/tests/qtest/sdcard-test.c
+@@ -0,0 +1,234 @@
++/*
++ * Native SD card identity, capacity and storage regressions.
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/bswap.h"
++#include "qobject/qdict.h"
++#include "libqtest.h"
++#include "libqos/pci-pc.h"
++#include "hw/pci/pci.h"
++
++typedef struct SDTest {
++    QTestState *qts;
++    QPCIBus *bus;
++    QPCIDevice *dev;
++    QPCIBar bar;
++    char *path;
++    int fd;
++    uint16_t rca;
++    bool high_capacity;
++} SDTest;
++
++typedef struct SDConfig {
++    const char *cid;
++    unsigned version;
++    uint64_t size;
++} SDConfig;
++
++static uint32_t sd_command(SDTest *s, unsigned cmd, uint32_t arg, bool data,
++                           bool read)
++{
++    unsigned response = cmd == 0 ? 0 :
++                        (cmd == 2 || cmd == 9 || cmd == 10 ? 1 : 2);
++
++    qpci_io_writew(s->dev, s->bar, 0x30, 0xffff);
++    qpci_io_writew(s->dev, s->bar, 0x32, 0xffff);
++    qpci_io_writew(s->dev, s->bar, 0x04, 512);
++    qpci_io_writew(s->dev, s->bar, 0x06, 1);
++    qpci_io_writel(s->dev, s->bar, 0x08, arg);
++    qpci_io_writew(s->dev, s->bar, 0x0c, 2 | (read ? 0x10 : 0));
++    qpci_io_writew(s->dev, s->bar, 0x0e,
++                   (cmd << 8) | response | (data ? 0x20 : 0));
++    g_assert_cmphex(qpci_io_readw(s->dev, s->bar, 0x32), ==, 0);
++    return qpci_io_readl(s->dev, s->bar, 0x10);
++}
++
++static void sd_read_r2(SDTest *s, uint8_t response[16])
++{
++    uint32_t words[4];
++
++    for (unsigned i = 0; i < 4; i++) {
++        words[i] = qpci_io_readl(s->dev, s->bar, 0x10 + (3 - i) * 4);
++    }
++    for (unsigned i = 0; i < 4; i++) {
++        stl_be_p(response + 4 * i,
++                 (words[i] << 8) | (i < 3 ? words[i + 1] >> 24 : 0));
++    }
++}
++
++static void sd_identify(SDTest *s, const SDConfig *config)
++{
++    uint32_t ocr = 0;
++    uint8_t cid[16], csd[16];
++
++    qpci_io_writeb(s->dev, s->bar, 0x2f, 1);
++    qpci_io_writew(s->dev, s->bar, 0x2c, 7);
++    qpci_io_writeb(s->dev, s->bar, 0x29, 0x0f);
++    qpci_io_writew(s->dev, s->bar, 0x34, 0xffff);
++    qpci_io_writew(s->dev, s->bar, 0x36, 0xffff);
++    sd_command(s, 0, 0, false, false);
++    g_assert_cmphex(sd_command(s, 8, 0x1aa, false, false), ==, 0x1aa);
++    for (unsigned i = 0; i < 100 && !(ocr & (1U << 31)); i++) {
++        sd_command(s, 55, 0, false, false);
++        ocr = sd_command(s, 41, 0x40ff8000, false, false);
++        qtest_clock_step(s->qts, 1000000);
++    }
++    g_assert_cmphex(ocr & (1U << 31), !=, 0);
++    s->high_capacity = ocr & (1U << 30);
++    g_assert_cmpint(s->high_capacity, ==, config->size > (2ULL << 30));
++    sd_command(s, 2, 0, false, false);
++    sd_read_r2(s, cid);
++    if (config->cid) {
++        for (unsigned i = 0; i < 15; i++) {
++            uint8_t expected =
++                (g_ascii_xdigit_value(config->cid[2 * i]) << 4) |
++                 g_ascii_xdigit_value(config->cid[2 * i + 1]);
++
++            g_assert_cmphex(cid[i], ==, expected);
++        }
++    } else {
++        g_assert_cmphex(cid[0], ==, 0xaa);
++    }
++    g_assert_cmphex(cid[15], ==, 0);
++    s->rca = sd_command(s, 3, 0, false, false) >> 16;
++    g_assert_cmphex(s->rca, !=, 0);
++    sd_command(s, 10, (uint32_t)s->rca << 16, false, false);
++    sd_read_r2(s, csd);
++    g_assert_cmpmem(cid, sizeof(cid), csd, sizeof(csd));
++    sd_command(s, 9, (uint32_t)s->rca << 16, false, false);
++    sd_read_r2(s, csd);
++    if (s->high_capacity) {
++        uint32_t csize = ((csd[7] & 0x3f) << 16) |
++                        (csd[8] << 8) | csd[9];
++
++        g_assert_cmpuint(((uint64_t)csize + 1) << 19, ==, config->size);
++    } else {
++        uint32_t csize = ((csd[6] & 3) << 10) | (csd[7] << 2) |
++                        (csd[8] >> 6);
++        unsigned mult = ((csd[9] & 3) << 1) | (csd[10] >> 7);
++
++        g_assert_cmpuint(((uint64_t)csize + 1) <<
++                         (mult + 2 + (csd[5] & 15)), ==, config->size);
++    }
++    sd_command(s, 7, (uint32_t)s->rca << 16, false, false);
++}
++
++static void sd_transfer(SDTest *s, uint32_t address, uint8_t data[512],
++                        bool read)
++{
++    sd_command(s, read ? 17 : 24, address, true, read);
++    for (unsigned i = 0; i < 512; i += 4) {
++        if (read) {
++            stl_le_p(data + i, qpci_io_readl(s->dev, s->bar, 0x20));
++        } else {
++            qpci_io_writel(s->dev, s->bar, 0x20, ldl_le_p(data + i));
++        }
++    }
++    qtest_clock_step(s->qts, 1000000);
++    g_assert_cmphex(qpci_io_readw(s->dev, s->bar, 0x32), ==, 0);
++}
++
++static void test_card(gconstpointer opaque)
++{
++    const SDConfig *config = opaque;
++    SDTest s = {};
++    uint8_t expected[512], actual[512];
++    g_autofree char *cid_arg = config->cid ?
++        g_strdup_printf(",cid=%s", config->cid) : g_strdup("");
++    uint32_t last;
++
++    s.fd = g_file_open_tmp("sdcard-test-XXXXXX", &s.path, NULL);
++    g_assert_cmpint(s.fd, >=, 0);
++    g_assert_cmpint(ftruncate(s.fd, config->size), ==, 0);
++    s.qts = qtest_initf("-machine pc -nodefaults "
++        "-device sdhci-pci,id=sdhci,addr=04.0,bootindex=7 "
++        "-device sd-card,id=card,drive=d0,spec_version=%u%s "
++        "-drive if=none,id=d0,file=%s,format=raw",
++        config->version, cid_arg, s.path);
++    s.bus = qpci_new_pc(s.qts, NULL);
++    s.dev = qpci_device_find(s.bus, QPCI_DEVFN(4, 0));
++    g_assert_nonnull(s.dev);
++    s.bar = qpci_iomap(s.dev, 0, NULL);
++    qpci_device_enable(s.dev);
++    for (unsigned pass = 0; pass < 2; pass++) {
++        if (pass) {
++            qtest_qmp_assert_success(s.qts, "{'execute':'system_reset'}");
++            s.bar = qpci_iomap(s.dev, 0, NULL);
++            qpci_device_enable(s.dev);
++        }
++        sd_identify(&s, config);
++        memset(expected, 0x5a + pass, sizeof(expected));
++        last = s.high_capacity ? config->size / 512 - 1 : config->size - 512;
++        sd_transfer(&s, last, expected, false);
++        sd_transfer(&s, last, actual, true);
++        g_assert_cmpmem(actual, sizeof(actual), expected, sizeof(expected));
++        if (config->cid) {
++            QDict *reply = qtest_qmp(s.qts,
++                "{'execute':'qom-get','arguments':"
++                "{'path':'/machine/peripheral/card','property':'cid'}}");
++
++            g_assert_cmpstr(qdict_get_str(reply, "return"), ==, config->cid);
++            qobject_unref(reply);
++        }
++    }
++    qpci_free_pc(s.bus);
++    qtest_quit(s.qts);
++    close(s.fd);
++    g_unlink(s.path);
++    g_free(s.path);
++    g_free(s.dev);
++}
++
++static void test_invalid_cid(gconstpointer opaque)
++{
++    const char *cid = opaque;
++
++    if (g_test_subprocess()) {
++        g_autofree char *command = g_strdup_printf(
++            "-machine pc -nodefaults -device sdhci-pci "
++            "-device 'sd-card,cid=%s'", cid);
++
++        QTestState *qts = qtest_init(command);
++
++        qtest_quit(qts);
++        return;
++    }
++    g_test_trap_subprocess(NULL, 10 * G_USEC_PER_SEC, 0);
++    g_test_trap_assert_failed();
++    g_test_trap_assert_stderr("*SD card cid must contain exactly 32 "
++                             "hexadecimal characters*");
++}
++
++int main(int argc, char **argv)
++{
++    static const SDConfig cases[] = {
++        { NULL, 3, 64ULL << 20 },
++        { "03534453443332478535bca2a70195df", 3, 64ULL << 20 },
++        { "00000aBc00000aBc00000aBc00000aBc", 2, 64ULL << 20 },
++        { NULL, 2, 256ULL << 10 },
++        { NULL, 3, 2ULL << 30 },
++        { NULL, 3, 3ULL << 30 },
++        { NULL, 3, 2ULL << 40 },
++    };
++    static const char *invalid[] = {
++        "", "a", "03534453443332478535bca2a70195dfff",
++        "03534453443332478535bca2a70195dg",
++        "0x534453443332478535bca2a70195df",
++        "03534453443332478535bca2a70195df\n",
++    };
++
++    g_test_init(&argc, &argv, NULL);
++    for (unsigned i = 0; i < G_N_ELEMENTS(cases); i++) {
++        g_autofree char *name = g_strdup_printf("sdcard/config/%u", i);
++
++        qtest_add_data_func(name, &cases[i], test_card);
++    }
++    for (unsigned i = 0; i < G_N_ELEMENTS(invalid); i++) {
++        g_autofree char *name = g_strdup_printf("sdcard/invalid-cid/%u", i);
++
++        qtest_add_data_func(name, invalid[i], test_invalid_cid);
++    }
++    return g_test_run();
++}
+--- a/docs/system/device-emulation.rst
++++ b/docs/system/device-emulation.rst
+@@ -89,6 +89,7 @@
+    devices/ccid.rst
+    devices/cxl.rst
+    devices/emmc.rst
++   devices/sdcard.rst
+    devices/igb.rst
+    devices/ivshmem-flat.rst
+    devices/ivshmem.rst
+--- /dev/null
++++ b/docs/system/devices/sdcard.rst
+@@ -0,0 +1,53 @@
++SD cards
++========
++
++The ``sd-card`` device models an SD memory card on an SD bus. On PCI machines,
++attach each card to its own ``sdhci-pci`` controller. For example:
++
++.. code-block:: console
++
++    qemu-img create -f raw sd.img 8G
++    qemu-system-x86_64 -machine pc -m 512 \
++        -drive file=sd.img,format=raw,if=none,id=sd-image \
++        -device sdhci-pci,id=sdhci,sd-spec-version=2,bootindex=1 \
++        -device sd-card,drive=sd-image,bus=pci.0/sdhci/sd-bus
++
++Unlike eMMC, the card uses the whole image as its user area, without boot or
++RPMB partition offsets.
++
++The ``spec_version`` property accepts ``2`` (SD v2.00) or ``3`` (SD v3.01,
++the default). Capacity selects standard or high-capacity addressing. Images
++up to 2 GiB must have a power-of-two size; the smallest exactly representable
++capacity is 256 KiB. Larger images use 512 KiB units and the SDHC/SDXC CSD
++encoding represents at most 2 TiB. Create partition tables and filesystems
++inside the guest.
++
++The optional ``cid`` property accepts exactly 32 hexadecimal characters:
++
++.. code-block:: console
++
++    -device sd-card,drive=sd-image,cid=03534453443332478535bca2a70195df
++
++Omitting it retains the existing identity. A configured value is reapplied
++on reset, preserves all supplied bytes and does not modify the image. The
++existing CID migration state is unchanged; configure the same value and SD
++specification at both migration endpoints. A realized device's CID property
++cannot be changed.
++
++Standard SDHCI response registers omit the final CRC/end-bit byte. Linux
++therefore reports ``00`` for the last byte in
++``/sys/block/mmcblkN/device/cid`` with this controller, even if the configured
++CID ends differently. This is a controller/driver limitation, not a property
++of SD cards themselves.
++
++The optional ``sdhci-pci.bootindex`` property associates boot priority with
++that controller's card. It defaults to ``-1`` (no priority). Guest firmware
++must contain SD/MMC boot drivers and understand QEMU boot order. SeaBIOS and
++PVE's 4 MiB UEFI firmware support this configuration; older 2 MiB UEFI builds
++may not include the required drivers. This property does not alter the
++default controller model or its migration format.
++
++Adding or removing SD card devices, changing capacity or changing identity
++requires a cold restart of the virtual machine. SD bus devices are not
++hotpluggable. SD cards have no eMMC RPMB key/counter state; ordinary disk
++backup, snapshot and migration mechanisms apply.
