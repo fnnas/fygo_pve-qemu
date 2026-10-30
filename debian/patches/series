@@ -89,3 +89,4 @@ pve/9005-emmc-enforce-partition-access-boundaries.patch
 pve/9006-sdhci-honor-combined-software-reset-bits.patch
 pve/9007-emmc-reject-unimplemented-partitions.patch
 pve/9008-emmc-support-configurable-cid.patch
+pve/9009-sd-card-support-configurable-cid-and-boot-order.patch
