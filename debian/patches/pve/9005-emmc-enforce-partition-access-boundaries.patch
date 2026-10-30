@@ -1,0 +1,523 @@
+Description: enforce eMMC partition isolation and RPMB frame bounds
+ Check regular reads, writes and erases against the selected partition instead
+ of the USER area. Reject RPMB accesses through unauthenticated single-block
+ and erase commands. Validate authenticated RPMB frame addresses and the full
+ read block count before accessing storage so requests cannot expose or
+ overwrite the adjacent USER area. Invalid writes preserve the write counter.
+ Add protocol regressions for partition ends, multi-block overflow and RPMB
+ command restrictions.
+Forwarded: no
+
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -2310,6 +2310,7 @@ F: include/hw/sd/sd*
+ F: hw/sd/core.c
+ F: hw/sd/sd*
+ F: hw/sd/ssi-sd.c
++F: tests/qtest/emmc-test.c
+ F: tests/qtest/fuzz-sdcard-test.c
+ F: tests/qtest/sdhci-test.c
+ 
+--- a/hw/sd/sd.c
++++ b/hw/sd/sd.c
+@@ -892,6 +892,30 @@ static uint32_t sd_part_offset(SDState *
+     }
+ }
+ 
++static bool sd_part_is_rpmb(SDState *sd)
++{
++    return sd_is_emmc(sd) &&
++           (sd->ext_csd[EXT_CSD_PART_CONFIG] & EXT_CSD_PART_CONFIG_ACC_MASK) ==
++           EXT_CSD_PART_CONFIG_ACC_RPMB;
++}
++
++static uint64_t sd_part_size(SDState *sd)
++{
++    if (sd_is_emmc(sd)) {
++        unsigned int part = sd->ext_csd[EXT_CSD_PART_CONFIG] &
++                            EXT_CSD_PART_CONFIG_ACC_MASK;
++
++        switch (part) {
++        case EXT_CSD_PART_CONFIG_ACC_BOOT1:
++        case EXT_CSD_PART_CONFIG_ACC_BOOT2:
++            return sd->boot_part_size;
++        case EXT_CSD_PART_CONFIG_ACC_RPMB:
++            return sd->rpmb_part_size;
++        }
++    }
++    return sd->size;
++}
++
+ static uint64_t sd_req_get_address(SDState *sd, SDRequest req)
+ {
+     uint64_t addr;
+@@ -1196,6 +1220,14 @@ static bool rpmb_calc_hmac(SDState *sd,
+     return success;
+ }
+ 
++static bool emmc_rpmb_range_valid(SDState *sd, unsigned int block,
++                                   unsigned int count)
++{
++    uint64_t blocks = sd->rpmb_part_size / RPMB_DATA_LEN;
++
++    return count && block < blocks && count <= blocks - block;
++}
++
+ static void emmc_rpmb_blk_read(SDState *sd, uint64_t addr, uint32_t len)
+ {
+     uint16_t resp = lduw_be_p(&sd->rpmb.result.req_resp);
+@@ -1203,6 +1235,17 @@ static void emmc_rpmb_blk_read(SDState *
+     unsigned int curr_block = 0;
+ 
+     if ((result & ~RPMB_RESULT_COUTER_EXPIRED) == RPMB_RESULT_OK &&
++        resp == RPMB_RESP(RPMB_REQ_AUTH_DATA_READ) &&
++        sd->rpmb.result.block_count == 0 &&
++        !emmc_rpmb_range_valid(sd, lduw_be_p(&sd->rpmb.result.address),
++                               sd->multi_blk_cnt)) {
++        result = RPMB_RESULT_ADDRESS_FAILURE |
++                 (result & RPMB_RESULT_COUTER_EXPIRED);
++        stw_be_p(&sd->rpmb.result.result, result);
++        memset(sd->rpmb.result.data, 0, sizeof(sd->rpmb.result.data));
++    }
++
++    if ((result & ~RPMB_RESULT_COUTER_EXPIRED) == RPMB_RESULT_OK &&
+         resp == RPMB_RESP(RPMB_REQ_AUTH_DATA_READ)) {
+         curr_block = lduw_be_p(&sd->rpmb.result.address);
+         if (sd->rpmb.result.block_count == 0) {
+@@ -1289,6 +1332,11 @@ static void emmc_rpmb_blk_write(SDState
+             stw_be_p(&sd->rpmb.result.result, RPMB_RESULT_COUNTER_FAILURE);
+             break;
+         }
++        if (!emmc_rpmb_range_valid(sd, lduw_be_p(&frame->address), 1)) {
++            stw_be_p(&sd->rpmb.result.result, RPMB_RESULT_ADDRESS_FAILURE);
++            stl_be_p(&sd->rpmb.result.write_counter, sd->rpmb.write_counter);
++            break;
++        }
+         sd->rpmb.result.address = frame->address;
+         addr = lduw_be_p(&frame->address) * RPMB_DATA_LEN + sd_part_offset(sd);
+         if (blk_pwrite(sd->blk, addr, RPMB_DATA_LEN, frame->data, 0) < 0) {
+@@ -1340,7 +1388,8 @@ static void sd_erase(SDState *sd)
+         sdsc = false;
+     }
+ 
+-    if (erase_start > sd->size || erase_end > sd->size) {
++    if (erase_start > erase_end || erase_start >= sd_part_size(sd) ||
++        erase_end > sd_part_size(sd) - erase_len) {
+         sd->card_status |= OUT_OF_RANGE;
+         sd->erase_start = INVALID_ADDRESS;
+         sd->erase_end = INVALID_ADDRESS;
+@@ -1555,10 +1604,16 @@ static void sd_lock_command(SDState *sd)
+ static bool address_in_range(SDState *sd, const char *desc,
+                              uint64_t addr, uint32_t length)
+ {
+-    if (addr + length > sd->size) {
++    uint64_t size = sd_part_size(sd);
++
++    /* RPMB command addresses describe transport frames, not storage blocks. */
++    if (sd_part_is_rpmb(sd)) {
++        return true;
++    }
++    if (addr > size || length > size - addr) {
+         qemu_log_mask(LOG_GUEST_ERROR,
+-                      "%s offset %"PRIu64" > card %"PRIu64" [%%%u]\n",
+-                      desc, addr, sd->size, length);
++                      "%s offset %"PRIu64" > partition %"PRIu64" [%%%u]\n",
++                      desc, addr, size, length);
+         sd->card_status |= ADDRESS_ERROR;
+         return false;
+     }
+@@ -1975,6 +2030,9 @@ static sd_rsp_type_t sd_cmd_READ_SINGLE_
+ {
+     uint64_t addr;
+ 
++    if (sd_part_is_rpmb(sd)) {
++        return sd_cmd_illegal(sd, req);
++    }
+     if (sd->state != sd_transfer_state) {
+         return sd_invalid_state_for_cmd(sd, req);
+     }
+@@ -2025,6 +2083,9 @@ static sd_rsp_type_t sd_cmd_WRITE_SINGLE
+ {
+     uint64_t addr;
+ 
++    if (sd_part_is_rpmb(sd)) {
++        return sd_cmd_illegal(sd, req);
++    }
+     if (sd->state != sd_transfer_state) {
+         return sd_invalid_state_for_cmd(sd, req);
+     }
+@@ -2127,6 +2188,9 @@ static sd_rsp_type_t sd_cmd_SEND_WRITE_P
+ /* CMD32 */
+ static sd_rsp_type_t sd_cmd_ERASE_WR_BLK_START(SDState *sd, SDRequest req)
+ {
++    if (sd_part_is_rpmb(sd)) {
++        return sd_cmd_illegal(sd, req);
++    }
+     if (sd->state != sd_transfer_state) {
+         return sd_invalid_state_for_cmd(sd, req);
+     }
+@@ -2137,6 +2201,9 @@ static sd_rsp_type_t sd_cmd_ERASE_WR_BLK
+ /* CMD33 */
+ static sd_rsp_type_t sd_cmd_ERASE_WR_BLK_END(SDState *sd, SDRequest req)
+ {
++    if (sd_part_is_rpmb(sd)) {
++        return sd_cmd_illegal(sd, req);
++    }
+     if (sd->state != sd_transfer_state) {
+         return sd_invalid_state_for_cmd(sd, req);
+     }
+@@ -2147,6 +2214,9 @@ static sd_rsp_type_t sd_cmd_ERASE_WR_BLK
+ /* CMD38 */
+ static sd_rsp_type_t sd_cmd_ERASE(SDState *sd, SDRequest req)
+ {
++    if (sd_part_is_rpmb(sd)) {
++        return sd_cmd_illegal(sd, req);
++    }
+     if (sd->state != sd_transfer_state) {
+         return sd_invalid_state_for_cmd(sd, req);
+     }
+@@ -2371,6 +2441,10 @@ static sd_rsp_type_t sd_normal_command(S
+         switch (sd->state) {
+         case sd_transfer_state:
+ 
++            if (sd_part_is_rpmb(sd)) {
++                /* Each transport read has its own frame count and bounds. */
++                sd->rpmb.result.block_count = 0;
++            }
+             if (!address_in_range(sd, "READ_BLOCK", addr, sd->blk_len)) {
+                 return sd_r1;
+             }
+--- /dev/null
++++ b/tests/qtest/emmc-test.c
+@@ -0,0 +1,320 @@
++/*
++ * eMMC partition isolation and RPMB access regressions.
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/bswap.h"
++#include "libqtest.h"
++#include "libqos/pci-pc.h"
++#include "hw/pci/pci.h"
++
++#define BOOT_SIZE (4 * 1024 * 1024)
++#define RPMB_SIZE (2 * 1024 * 1024)
++#define USER_OFFSET (2 * BOOT_SIZE + RPMB_SIZE)
++#define USER_SIZE (64 * 1024 * 1024)
++#define FRAME_SIZE 512
++#define FRAME_MAC 196
++#define FRAME_DATA 228
++#define FRAME_COUNTER 500
++#define FRAME_ADDRESS 504
++#define FRAME_COUNT 506
++#define FRAME_RESULT 508
++#define FRAME_REQUEST 510
++#define RPMB_BLOCKS (RPMB_SIZE / 256)
++#define ADDRESS_ERROR (1U << 30)
++#define OUT_OF_RANGE (1U << 31)
++
++typedef struct EMMCTest {
++    QTestState *qts;
++    QPCIBus *bus;
++    QPCIDevice *dev;
++    QPCIBar bar;
++    char *path;
++    int fd;
++    bool high_capacity;
++} EMMCTest;
++
++static uint32_t emmc_command(EMMCTest *s, unsigned cmd, uint32_t arg,
++                             bool data, unsigned count, bool read)
++{
++    qpci_io_writew(s->dev, s->bar, 0x30, 0xffff);
++    qpci_io_writew(s->dev, s->bar, 0x32, 0xffff);
++    qpci_io_writew(s->dev, s->bar, 0x04, FRAME_SIZE);
++    qpci_io_writew(s->dev, s->bar, 0x06, count);
++    qpci_io_writel(s->dev, s->bar, 0x08, arg);
++    qpci_io_writew(s->dev, s->bar, 0x0c,
++                   0x02 | (count > 1 ? 0x20 : 0) | (read ? 0x10 : 0));
++    qpci_io_writew(s->dev, s->bar, 0x0e,
++                   (cmd << 8) | (data ? 0x20 : 0) | (cmd ? 2 : 0));
++    return qpci_io_readl(s->dev, s->bar, 0x10);
++}
++
++static void emmc_fifo(EMMCTest *s, uint8_t *frame, bool read)
++{
++    for (unsigned i = 0; i < FRAME_SIZE; i += 4) {
++        if (read) {
++            stl_le_p(frame + i, qpci_io_readl(s->dev, s->bar, 0x20));
++        } else {
++            qpci_io_writel(s->dev, s->bar, 0x20, ldl_le_p(frame + i));
++        }
++    }
++    qtest_clock_step(s->qts, 1000000);
++}
++
++static void emmc_select(EMMCTest *s, unsigned partition)
++{
++    uint32_t status = emmc_command(s, 6, 0x03b30000 | (partition << 8),
++                                    false, 0, false);
++
++    g_assert_cmphex(status & (ADDRESS_ERROR | OUT_OF_RANGE), ==, 0);
++    qtest_clock_step(s->qts, 1000000);
++}
++
++static void rpmb_send(EMMCTest *s, uint8_t *frame)
++{
++    emmc_command(s, 23, 1, false, 0, false);
++    emmc_command(s, 25, 0, true, 1, false);
++    emmc_fifo(s, frame, false);
++}
++
++static void rpmb_read(EMMCTest *s, uint8_t *frame, unsigned count)
++{
++    emmc_command(s, 23, count, false, 0, false);
++    emmc_command(s, 18, 0, true, count, true);
++    for (unsigned i = 0; i < count; i++) {
++        emmc_fifo(s, frame + i * FRAME_SIZE, true);
++    }
++}
++
++static void rpmb_request(uint8_t *frame, unsigned request, unsigned address)
++{
++    memset(frame, 0, FRAME_SIZE);
++    stw_be_p(frame + FRAME_ADDRESS, address);
++    stw_be_p(frame + FRAME_REQUEST, request);
++}
++
++static void emmc_init(EMMCTest *s)
++{
++    uint8_t sentinel[FRAME_SIZE];
++    uint8_t frame[FRAME_SIZE];
++    uint32_t ocr = 0;
++
++    memset(sentinel, 0x5a, sizeof(sentinel));
++    s->fd = g_file_open_tmp("emmc-test-XXXXXX", &s->path, NULL);
++    g_assert_cmpint(s->fd, >=, 0);
++    g_assert_cmpint(ftruncate(s->fd, USER_OFFSET + USER_SIZE), ==, 0);
++    g_assert_cmpint(pwrite(s->fd, sentinel, sizeof(sentinel), USER_OFFSET),
++                    ==, sizeof(sentinel));
++    s->qts = qtest_initf("-machine pc -nodefaults "
++                        "-device sdhci-pci,id=sdhci,addr=04.0,sd-spec-version=3 "
++                        "-device emmc,drive=d0,boot-partition-size=%u,"
++                        "rpmb-partition-size=%u "
++                        "-drive if=none,id=d0,file=%s,format=raw",
++                        BOOT_SIZE, RPMB_SIZE, s->path);
++    s->bus = qpci_new_pc(s->qts, NULL);
++    s->dev = qpci_device_find(s->bus, QPCI_DEVFN(4, 0));
++    g_assert_nonnull(s->dev);
++    s->bar = qpci_iomap(s->dev, 0, NULL);
++    qpci_device_enable(s->dev);
++    qpci_io_writeb(s->dev, s->bar, 0x2f, 1);
++    qpci_io_writew(s->dev, s->bar, 0x2c, 7);
++    qpci_io_writeb(s->dev, s->bar, 0x29, 0x0f);
++    qpci_io_writew(s->dev, s->bar, 0x34, 0xffff);
++    qpci_io_writew(s->dev, s->bar, 0x36, 0xffff);
++    emmc_command(s, 0, 0, false, 0, false);
++    for (unsigned i = 0; i < 100 && !(ocr & (1U << 31)); i++) {
++        ocr = emmc_command(s, 1, 0x40ff8000, false, 0, false);
++        qtest_clock_step(s->qts, 1000000);
++    }
++    g_assert_cmphex(ocr & (1U << 31), !=, 0);
++    s->high_capacity = ocr & (1U << 30);
++    emmc_command(s, 2, 0, false, 0, false);
++    emmc_command(s, 3, 1U << 16, false, 0, false);
++    emmc_command(s, 7, 1U << 16, false, 0, false);
++    qtest_clock_step(s->qts, 1000000);
++
++    /* QEMU 11.0 programs the RPMB key through the card protocol. */
++    emmc_select(s, 3);
++    rpmb_request(frame, 1, 0);
++    memset(frame + FRAME_MAC, 'A', 32);
++    rpmb_send(s, frame);
++    rpmb_read(s, frame, 1);
++    g_assert_cmpuint(lduw_be_p(frame + FRAME_RESULT), ==, 0);
++    emmc_select(s, 0);
++}
++
++static void emmc_cleanup(EMMCTest *s)
++{
++    g_free(s->dev);
++    qpci_free_pc(s->bus);
++    qtest_quit(s->qts);
++    close(s->fd);
++    g_unlink(s->path);
++    g_free(s->path);
++}
++
++static uint32_t emmc_address(EMMCTest *s, uint32_t address)
++{
++    return s->high_capacity ? address / FRAME_SIZE : address;
++}
++
++static void rpmb_sign(uint8_t *frame)
++{
++    const uint8_t key[32] = {
++        [0 ... 31] = 'A'
++    };
++    GHmac *hmac = g_hmac_new(G_CHECKSUM_SHA256, key, sizeof(key));
++    size_t length = 32;
++
++    g_hmac_update(hmac, frame + FRAME_DATA, FRAME_SIZE - FRAME_DATA);
++    g_hmac_get_digest(hmac, frame + FRAME_MAC, &length);
++    g_hmac_unref(hmac);
++}
++
++static void rpmb_check_mac(const uint8_t *frame)
++{
++    uint8_t expected[FRAME_SIZE];
++
++    memcpy(expected, frame, sizeof(expected));
++    rpmb_sign(expected);
++    g_assert_cmpmem(frame + FRAME_MAC, 32, expected + FRAME_MAC, 32);
++}
++
++static void test_rpmb_read_bounds(void)
++{
++    EMMCTest s = {};
++    uint8_t frame[2 * FRAME_SIZE];
++
++    emmc_init(&s);
++    emmc_select(&s, 3);
++    rpmb_request(frame, 4, RPMB_BLOCKS - 1);
++    rpmb_send(&s, frame);
++    rpmb_read(&s, frame, 1);
++    g_assert_cmpuint(lduw_be_p(frame + FRAME_RESULT), ==, 0);
++    rpmb_request(frame, 4, RPMB_BLOCKS);
++    rpmb_send(&s, frame);
++    rpmb_read(&s, frame, 1);
++    g_assert_cmpuint(lduw_be_p(frame + FRAME_RESULT), ==, 4);
++    rpmb_check_mac(frame);
++    rpmb_request(frame, 4, RPMB_BLOCKS - 1);
++    rpmb_send(&s, frame);
++    rpmb_read(&s, frame, 2);
++    for (unsigned i = 0; i < 2; i++) {
++        g_assert_cmpuint(lduw_be_p(frame + i * FRAME_SIZE + FRAME_RESULT),
++                         ==, 4);
++        rpmb_check_mac(frame + i * FRAME_SIZE);
++        for (unsigned j = 0; j < 256; j++) {
++            g_assert_cmpuint(frame[i * FRAME_SIZE + FRAME_DATA + j], ==, 0);
++        }
++    }
++    emmc_cleanup(&s);
++}
++
++static void test_rpmb_read_restart(void)
++{
++    EMMCTest s = {};
++    uint8_t frame[2 * FRAME_SIZE];
++
++    emmc_init(&s);
++    emmc_select(&s, 3);
++    rpmb_request(frame, 4, RPMB_BLOCKS - 1);
++    rpmb_send(&s, frame);
++    rpmb_read(&s, frame, 1);
++    g_assert_cmpuint(lduw_be_p(frame + FRAME_RESULT), ==, 0);
++    /* A new CMD18 must check its full count without another request frame. */
++    rpmb_read(&s, frame, 2);
++    for (unsigned i = 0; i < 2; i++) {
++        g_assert_cmpuint(lduw_be_p(frame + i * FRAME_SIZE + FRAME_RESULT),
++                         ==, 4);
++        rpmb_check_mac(frame + i * FRAME_SIZE);
++    }
++    emmc_cleanup(&s);
++}
++
++static void test_rpmb_write_bounds(void)
++{
++    EMMCTest s = {};
++    uint8_t frame[FRAME_SIZE];
++    uint8_t sentinel[FRAME_SIZE];
++
++    emmc_init(&s);
++    emmc_select(&s, 3);
++    for (unsigned counter = 0; counter < 2; counter++) {
++        rpmb_request(frame, 3, RPMB_BLOCKS - 1 + counter);
++        memset(frame + FRAME_DATA, 0xa5, 256);
++        stl_be_p(frame + FRAME_COUNTER, counter);
++        stw_be_p(frame + FRAME_COUNT, 1);
++        rpmb_sign(frame);
++        rpmb_send(&s, frame);
++        rpmb_request(frame, 5, 0);
++        rpmb_send(&s, frame);
++        rpmb_read(&s, frame, 1);
++        g_assert_cmpuint(lduw_be_p(frame + FRAME_RESULT), ==, counter ? 4 : 0);
++        g_assert_cmpuint(ldl_be_p(frame + FRAME_COUNTER), ==, 1);
++        rpmb_check_mac(frame);
++    }
++    g_assert_cmpint(pread(s.fd, sentinel, sizeof(sentinel), USER_OFFSET),
++                    ==, sizeof(sentinel));
++    for (unsigned i = 0; i < sizeof(sentinel); i++) {
++        g_assert_cmphex(sentinel[i], ==, 0x5a);
++    }
++    emmc_cleanup(&s);
++}
++
++static void test_boot_bounds(void)
++{
++    EMMCTest s = {};
++    uint8_t frame[FRAME_SIZE];
++    uint32_t status;
++
++    emmc_init(&s);
++    for (unsigned part = 1; part <= 2; part++) {
++        emmc_select(&s, part);
++        status = emmc_command(&s, 17, emmc_address(&s, BOOT_SIZE - FRAME_SIZE),
++                              true, 1, true);
++        g_assert_cmphex(status & ADDRESS_ERROR, ==, 0);
++        emmc_fifo(&s, frame, true);
++        status = emmc_command(&s, 17, emmc_address(&s, BOOT_SIZE),
++                              true, 1, true);
++        g_assert_cmphex(status & ADDRESS_ERROR, !=, 0);
++        qpci_io_writeb(s.dev, s.bar, 0x2f, 4);
++        status = emmc_command(&s, 24, emmc_address(&s, BOOT_SIZE),
++                              true, 1, false);
++        g_assert_cmphex(status & ADDRESS_ERROR, !=, 0);
++        qpci_io_writeb(s.dev, s.bar, 0x2f, 4);
++        emmc_command(&s, 35, emmc_address(&s, BOOT_SIZE - FRAME_SIZE),
++                     false, 0, false);
++        emmc_command(&s, 36, emmc_address(&s, BOOT_SIZE), false, 0, false);
++        status = emmc_command(&s, 38, 0, false, 0, false);
++        g_assert_cmphex(status & OUT_OF_RANGE, !=, 0);
++    }
++    emmc_cleanup(&s);
++}
++
++static void test_rpmb_requires_frames(void)
++{
++    EMMCTest s = {};
++    const unsigned commands[] = {17, 24, 35, 36, 38};
++
++    emmc_init(&s);
++    emmc_select(&s, 3);
++    for (unsigned i = 0; i < G_N_ELEMENTS(commands); i++) {
++        emmc_command(&s, commands[i], 0, commands[i] == 17 || commands[i] == 24,
++                     1, commands[i] == 17);
++        g_assert_cmphex(qpci_io_readw(s.dev, s.bar, 0x32) & 1, !=, 0);
++        qpci_io_writeb(s.dev, s.bar, 0x2f, 4);
++    }
++    emmc_cleanup(&s);
++}
++
++int main(int argc, char **argv)
++{
++    g_test_init(&argc, &argv, NULL);
++    qtest_add_func("emmc/rpmb-read-bounds", test_rpmb_read_bounds);
++    qtest_add_func("emmc/rpmb-read-restart", test_rpmb_read_restart);
++    qtest_add_func("emmc/rpmb-write-bounds", test_rpmb_write_bounds);
++    qtest_add_func("emmc/boot-bounds", test_boot_bounds);
++    qtest_add_func("emmc/rpmb-requires-frames", test_rpmb_requires_frames);
++    return g_test_run();
++}
+--- a/tests/qtest/meson.build
++++ b/tests/qtest/meson.build
+@@ -93,7 +93,7 @@ qtests_i386 = \
+   (config_all_devices.has_key('CONFIG_VIRTIO_BALLOON') ? ['virtio-balloon-test'] : []) + \
+   (config_all_devices.has_key('CONFIG_Q35') ? ['q35-test'] : []) +                          \
+   (config_all_devices.has_key('CONFIG_SB16') ? ['fuzz-sb16-test'] : []) +                   \
+-  (config_all_devices.has_key('CONFIG_SDHCI_PCI') ? ['fuzz-sdcard-test'] : []) +            \
++  (config_all_devices.has_key('CONFIG_SDHCI_PCI') ? ['fuzz-sdcard-test', 'emmc-test'] : []) +            \
+   (config_all_devices.has_key('CONFIG_ESP_PCI') ? ['am53c974-test'] : []) +                 \
+   (config_all_devices.has_key('CONFIG_AMD_IOMMU') ? ['amd-iommu-test'] : []) +             \
+   (config_all_devices.has_key('CONFIG_VTD') ? ['intel-iommu-test'] : []) +                 \

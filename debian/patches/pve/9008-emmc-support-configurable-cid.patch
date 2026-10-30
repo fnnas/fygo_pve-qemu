@@ -1,0 +1,258 @@
+Description: allow a persistent custom eMMC card identification register
+ Add an optional emmc.cid property containing a complete 16-byte hexadecimal
+ register value. Validate before realize and reapply on reset while keeping
+ the existing CID migration state and default SD/eMMC identities unchanged.
+ Cover default/custom CID responses, leading zeroes, reset and invalid input.
+ Document SDHCI's omission of the final CRC byte from Linux sysfs readback.
+Forwarded: no
+
+--- a/hw/sd/sd.c
++++ b/hw/sd/sd.c
+@@ -147,6 +147,7 @@ struct SDState {
+     uint32_t ocr;
+     uint8_t scr[8];
+     uint8_t cid[16];
++    char *cid_config;
+     uint8_t csd[16];
+     uint16_t rca;
+     uint32_t card_status;
+@@ -480,6 +481,15 @@ static void sd_set_cid(SDState *sd)
+ 
+ static void emmc_set_cid(SDState *sd)
+ {
++    if (sd->cid_config) {
++        /* Validated before realize; restore the configured CID on reset. */
++        for (unsigned i = 0; i < sizeof(sd->cid); i++) {
++            sd->cid[i] = (g_ascii_xdigit_value(sd->cid_config[2 * i]) << 4) |
++                         g_ascii_xdigit_value(sd->cid_config[2 * i + 1]);
++        }
++        return;
++    }
++
+     sd->cid[0] = MID;       /* Fake card manufacturer ID (MID) */
+     sd->cid[1] = 0b01;      /* CBX: soldered BGA */
+     sd->cid[2] = OID[0];    /* OEM/Application ID (OID) */
+@@ -3213,6 +3223,21 @@ static void emmc_realize(DeviceState *de
+ {
+     SDState *sd = SDMMC_COMMON(dev);
+ 
++    if (sd->cid_config) {
++        if (strlen(sd->cid_config) != 2 * sizeof(sd->cid)) {
++            error_setg(errp,
++                       "eMMC cid must contain exactly 32 hexadecimal characters");
++            return;
++        }
++        for (unsigned i = 0; i < 2 * sizeof(sd->cid); i++) {
++            if (!g_ascii_isxdigit(sd->cid_config[i])) {
++                error_setg(errp,
++                           "eMMC cid must contain exactly 32 hexadecimal characters");
++                return;
++            }
++        }
++    }
++
+     sd->spec_version = SD_PHY_SPECv3_01_VERS; /* Actually v4.5 */
+ 
+     sd_realize(dev, errp);
+@@ -3228,6 +3253,7 @@ static const Property sd_properties[] =
+ };
+ 
+ static const Property emmc_properties[] = {
++    DEFINE_PROP_STRING("cid", SDState, cid_config),
+     DEFINE_PROP_UINT64("boot-partition-size", SDState, boot_part_size, 0),
+     DEFINE_PROP_UINT8("boot-config", SDState, boot_config, 0x0),
+     DEFINE_PROP_UINT64("rpmb-partition-size", SDState, rpmb_part_size, 0),
+--- a/tests/qtest/emmc-test.c
++++ b/tests/qtest/emmc-test.c
+@@ -5,6 +5,7 @@
+ 
+ #include "qemu/osdep.h"
+ #include "qemu/bswap.h"
++#include "qobject/qdict.h"
+ #include "libqtest.h"
+ #include "libqos/pci-pc.h"
+ #include "hw/pci/pci.h"
+@@ -94,8 +95,10 @@ static void rpmb_request(uint8_t *frame,
+     stw_be_p(frame + FRAME_REQUEST, request);
+ }
+ 
+-static void emmc_init(EMMCTest *s)
++static void emmc_init_with_cid(EMMCTest *s, const char *cid)
+ {
++    g_autofree char *cid_option = cid ? g_strdup_printf(",cid=%s", cid) :
++                                     g_strdup("");
+     uint8_t sentinel[FRAME_SIZE];
+     uint8_t frame[FRAME_SIZE];
+     uint32_t ocr = 0;
+@@ -108,10 +111,10 @@ static void emmc_init(EMMCTest *s)
+                     ==, sizeof(sentinel));
+     s->qts = qtest_initf("-machine pc -nodefaults "
+                         "-device sdhci-pci,id=sdhci,addr=04.0,sd-spec-version=3 "
+-                        "-device emmc,drive=d0,boot-partition-size=%u,"
+-                        "rpmb-partition-size=%u "
++                        "-device emmc,id=emmc,drive=d0,boot-partition-size=%u,"
++                        "rpmb-partition-size=%u%s "
+                         "-drive if=none,id=d0,file=%s,format=raw",
+-                        BOOT_SIZE, RPMB_SIZE, s->path);
++                        BOOT_SIZE, RPMB_SIZE, cid_option, s->path);
+     s->bus = qpci_new_pc(s->qts, NULL);
+     s->dev = qpci_device_find(s->bus, QPCI_DEVFN(4, 0));
+     g_assert_nonnull(s->dev);
+@@ -144,6 +147,11 @@ static void emmc_init(EMMCTest *s)
+     emmc_select(s, 0);
+ }
+ 
++static void emmc_init(EMMCTest *s)
++{
++    emmc_init_with_cid(s, NULL);
++}
++
+ static void emmc_cleanup(EMMCTest *s)
+ {
+     g_free(s->dev);
+@@ -350,6 +358,93 @@ static void test_unsupported_partition(v
+     emmc_cleanup(&s);
+ }
+ 
++static void emmc_read_r2(EMMCTest *s, uint8_t response[16])
++{
++    /* SDHCI omits the CRC byte, as does Linux's raw_cid representation. */
++    for (unsigned i = 0; i < 4; i++) {
++        unsigned offset = 0x10 + (3 - i) * 4;
++        uint32_t word = qpci_io_readl(s->dev, s->bar, offset) << 8;
++
++        if (i != 3) {
++            word |= qpci_io_readb(s->dev, s->bar, offset - 1);
++        }
++        stl_be_p(response + i * 4, word);
++    }
++}
++
++static void test_cid(gconstpointer opaque)
++{
++    const char *cid = opaque;
++    const uint8_t default_cid[16] = {
++        0xaa, 0x01, 'X', 'Q', 'E', 'M', 'U', '!', '!', 0x01,
++        0xde, 0xad, 0xbe, 0xef, 0x29, 0x00,
++    };
++    EMMCTest s = {};
++    uint8_t expected[16], response[16];
++
++    memcpy(expected, default_cid, sizeof(expected));
++    if (cid) {
++        for (unsigned i = 0; i < 15; i++) {
++            expected[i] = (g_ascii_xdigit_value(cid[2 * i]) << 4) |
++                          g_ascii_xdigit_value(cid[2 * i + 1]);
++        }
++        expected[15] = 0;
++    }
++    emmc_init_with_cid(&s, cid);
++    for (unsigned round = 0; round < 2; round++) {
++        uint32_t ocr = 0;
++
++        if (round) {
++            qtest_system_reset(s.qts);
++            s.bar = qpci_iomap(s.dev, 0, NULL);
++            qpci_device_enable(s.dev);
++        }
++        qpci_io_writeb(s.dev, s.bar, 0x2f, 1);
++        qpci_io_writew(s.dev, s.bar, 0x2c, 7);
++        qpci_io_writeb(s.dev, s.bar, 0x29, 0x0f);
++        emmc_command(&s, 0, 0, false, 0, false);
++        for (unsigned i = 0; i < 100 && !(ocr & (1U << 31)); i++) {
++            ocr = emmc_command(&s, 1, 0x40ff8000, false, 0, false);
++            qtest_clock_step(s.qts, 1000000);
++        }
++        g_assert_cmphex(ocr & (1U << 31), !=, 0);
++        emmc_command(&s, 2, 0, false, 0, false);
++        emmc_read_r2(&s, response);
++        g_assert_cmpmem(response, sizeof(response), expected, sizeof(expected));
++        emmc_command(&s, 3, 1U << 16, false, 0, false);
++        emmc_command(&s, 10, 1U << 16, false, 0, false);
++        emmc_read_r2(&s, response);
++        g_assert_cmpmem(response, sizeof(response), expected, sizeof(expected));
++    }
++    if (cid) {
++        QDict *reply = qtest_qmp(s.qts,
++            "{'execute':'qom-get','arguments':{"
++            "'path':'/machine/peripheral/emmc','property':'cid'}}");
++
++        g_assert_cmpstr(qdict_get_str(reply, "return"), ==, cid);
++        qobject_unref(reply);
++    }
++    emmc_cleanup(&s);
++}
++
++static void test_invalid_cid(gconstpointer opaque)
++{
++    const char *cid = opaque;
++
++    if (g_test_subprocess()) {
++        QTestState *qts = qtest_initf("-machine pc -nodefaults "
++                                    "-device sdhci-pci,id=sdhci "
++                                    "-device 'emmc,cid=%s'", cid);
++
++        qtest_quit(qts);
++        return;
++    }
++    g_test_trap_subprocess(NULL, 10 * G_TIME_SPAN_SECOND, 0);
++    g_test_trap_assert_failed();
++    g_test_trap_assert_stderr("*eMMC cid must contain exactly 32 "
++                             "hexadecimal characters*");
++}
++
+ int main(int argc, char **argv)
+ {
+     g_test_init(&argc, &argv, NULL);
+@@ -360,5 +455,21 @@ int main(int argc, char **argv)
+     qtest_add_func("emmc/rpmb-requires-frames", test_rpmb_requires_frames);
+     qtest_add_func("emmc/combined-reset", test_combined_reset);
+     qtest_add_func("emmc/unsupported-partition", test_unsupported_partition);
++    qtest_add_data_func("emmc/cid/default", NULL, test_cid);
++    qtest_add_data_func("emmc/cid/custom", "15010043494431323310012345672900",
++                        test_cid);
++    qtest_add_data_func("emmc/cid/leading-zeroes",
++                        "00000aBc00000aBc00000aBc00000aBc", test_cid);
++    qtest_add_data_func("emmc/cid/invalid-empty", "", test_invalid_cid);
++    qtest_add_data_func("emmc/cid/invalid-short",
++                        "1501004349443132331001234567290", test_invalid_cid);
++    qtest_add_data_func("emmc/cid/invalid-long",
++                        "150100434944313233100123456729000", test_invalid_cid);
++    qtest_add_data_func("emmc/cid/invalid-hex",
++                        "1501004349443132331001234567290g", test_invalid_cid);
++    qtest_add_data_func("emmc/cid/invalid-prefix",
++                        "0x010043494431323310012345672900", test_invalid_cid);
++    qtest_add_data_func("emmc/cid/invalid-newline",
++                        "15010043494431323310012345672900\n", test_invalid_cid);
+     return g_test_run();
+ }
+--- a/docs/system/devices/emmc.rst
++++ b/docs/system/devices/emmc.rst
+@@ -53,3 +53,27 @@ SDHCI controllers while assuming that th
+     -drive file=emmc.img,if=none,format=raw,id=emmc-img
+     -device sdhci-pci
+     -device emmc,drive=emmc-img,boot-partition-size=1048576,rpmb-partition-size=2097152
++
++Custom Card Identification
++==========================
++
++The optional ``cid`` property sets the 128-bit card identification register.
++Provide exactly 32 hexadecimal characters, without a ``0x`` prefix or spaces.
++Both uppercase and lowercase are accepted. When omitted, the existing QEMU
++identity is used. This property is specific to eMMC and does not change SD cards.
++For example, add the following property to the eMMC device:
++
++.. code-block:: console
++
++    -device emmc,drive=emmc-img,cid=15010043494431323310012345672900
++
++The value is reapplied on device reset. Configure the same value on migration
++endpoints; the existing CID migration state is unchanged. Changing CID does not
++modify the backing image. A realized device's CID property cannot be changed.
++
++SDHCI omits the final CRC/end-bit byte from its 136-bit response registers.
++Consequently Linux's ``/sys/block/mmcblk0/device/cid`` reports that last byte as
++``00``, regardless of the property's last two hexadecimal characters. The other
++15 bytes match the configured value. Values copied from Linux sysfs can be used
++directly, including their final ``00``; QEMU does not validate or regenerate the
++CRC byte of a custom CID.

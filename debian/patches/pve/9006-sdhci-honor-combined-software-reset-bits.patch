@@ -1,0 +1,77 @@
+Description: honor combined SDHCI software reset bits
+ Process command and data reset bits independently. Treating the register as
+ an enumeration ignores a combined request and leaves the data channel stuck
+ after a failed eMMC transfer. An all reset still takes precedence.
+ Add a regression that requests both resets with an active read and checks
+ that command status, data inhibit and subsequent eMMC I/O recover.
+Forwarded: no
+
+--- a/hw/sd/sdhci.c
++++ b/hw/sd/sdhci.c
+@@ -1149,15 +1149,15 @@ static inline void sdhci_blkgap_write(SD
+ 
+ static inline void sdhci_reset_write(SDHCIState *s, uint8_t value)
+ {
+-    switch (value) {
+-    case SDHC_RESET_ALL:
++    if (value & SDHC_RESET_ALL) {
+         sdhci_reset(s);
+-        break;
+-    case SDHC_RESET_CMD:
++        return;
++    }
++    if (value & SDHC_RESET_CMD) {
+         s->prnsts &= ~SDHC_CMD_INHIBIT;
+         s->norintsts &= ~SDHC_NIS_CMDCMP;
+-        break;
+-    case SDHC_RESET_DATA:
++    }
++    if (value & SDHC_RESET_DATA) {
+         s->data_count = 0;
+         s->prnsts &= ~(SDHC_SPACE_AVAILABLE | SDHC_DATA_AVAILABLE |
+                 SDHC_DOING_READ | SDHC_DOING_WRITE |
+@@ -1166,7 +1166,6 @@ static inline void sdhci_reset_write(SDH
+         s->stopped_state = sdhc_not_stopped;
+         s->norintsts &= ~(SDHC_NIS_WBUFRDY | SDHC_NIS_RBUFRDY |
+                 SDHC_NIS_DMA | SDHC_NIS_TRSCMP | SDHC_NIS_BLKGAP);
+-        break;
+     }
+ }
+ 
+--- a/tests/qtest/emmc-test.c
++++ b/tests/qtest/emmc-test.c
+@@ -308,6 +308,27 @@ static void test_rpmb_requires_frames(vo
+     emmc_cleanup(&s);
+ }
+ 
++static void test_combined_reset(void)
++{
++    EMMCTest s = {};
++    uint8_t frame[FRAME_SIZE];
++
++    emmc_init(&s);
++    emmc_command(&s, 17, 0, true, 1, true);
++    g_assert_cmphex(qpci_io_readl(s.dev, s.bar, 0x24) & 2, !=, 0);
++    g_assert_cmphex(qpci_io_readw(s.dev, s.bar, 0x30) & 1, !=, 0);
++    /* Command and data reset bits can be requested together. */
++    qpci_io_writeb(s.dev, s.bar, 0x2f, 6);
++    g_assert_cmphex(qpci_io_readl(s.dev, s.bar, 0x24) & 2, ==, 0);
++    g_assert_cmphex(qpci_io_readw(s.dev, s.bar, 0x30) & 1, ==, 0);
++    emmc_command(&s, 17, 0, true, 1, true);
++    emmc_fifo(&s, frame, true);
++    for (unsigned i = 0; i < FRAME_SIZE; i++) {
++        g_assert_cmphex(frame[i], ==, 0x5a);
++    }
++    emmc_cleanup(&s);
++}
++
+ int main(int argc, char **argv)
+ {
+     g_test_init(&argc, &argv, NULL);
+@@ -316,5 +337,6 @@ int main(int argc, char **argv)
+     qtest_add_func("emmc/rpmb-write-bounds", test_rpmb_write_bounds);
+     qtest_add_func("emmc/boot-bounds", test_boot_bounds);
+     qtest_add_func("emmc/rpmb-requires-frames", test_rpmb_requires_frames);
++    qtest_add_func("emmc/combined-reset", test_combined_reset);
+     return g_test_run();
+ }
