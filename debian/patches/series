@@ -88,3 +88,4 @@ pve/9004-seabios-skip-unsupported-NVMe-metadata.patch
 pve/9005-emmc-enforce-partition-access-boundaries.patch
 pve/9006-sdhci-honor-combined-software-reset-bits.patch
 pve/9007-emmc-reject-unimplemented-partitions.patch
+pve/9008-emmc-support-configurable-cid.patch
