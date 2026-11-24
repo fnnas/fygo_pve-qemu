@@ -95,8 +95,7 @@ build-stamp: ${BUILDDIR}/config.status
 
 	# Add here commands to compile the package.
 	# Match the namespace paths emitted by QEMU in the bundled PC BIOS.
-	$(MAKE) -C roms build-seabios-config-seabios-256k PYTHON=python3
-	cp roms/seabios/builds/seabios-256k/bios.bin pc-bios/bios-256k.bin
+	$(MAKE) -C roms build-custom-seabios-256k PYTHON=python3
 	$(MAKE)
 
 	#docbook-to-man debian/kvm.sgml > kvm.1
@@ -130,6 +129,8 @@ install: build
 	rm -f $(destdir)/usr/lib/kvm/virtfs-proxy-helper
 
 	# CPU flags are static for QEMU version, allows avoiding more costly checks
+	set -e; options="$$( $(destdir)/usr/bin/qemu-system-x86_64 -device usb4-host,help )"; \
+	    printf '%s\n' "$$options" | grep -Fx 'usb4-host options:'
 	./debian/parse-cpu-flags.pl $(destdir)/usr/bin/qemu-system-x86_64 max-x86_64-cpu > $(flagfile)
 	# NOTE: If the diff fails here after upgrading the QEMU submodule, check which new flags
 	# are to be picked up and which are to be excluded, adapt to other changes and commit the

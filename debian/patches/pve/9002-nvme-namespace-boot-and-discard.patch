@@ -1,0 +1,748 @@
+Description: NVMe namespace boot paths, protection information and SeaBIOS
+Forwarded: no
+X-QEMU-Base-Commit: ec74e34c3f346c4006598d3a821f1e80825be775
+X-QEMU-Commit: 60020476f524238c976c163b5bfcc9110676b7d4
+
+diff --git a/.gitattributes b/.gitattributes
+index 6a4c0a7c49..cbfd2e09eb 100644
+--- a/.gitattributes
++++ b/.gitattributes
+@@ -13,3 +13,5 @@ hw/usb4/**              text eol=lf
+ include/hw/usb4/**      text eol=lf
+ tests/qtest/usb4-*      text eol=lf
+ tests/usb4/**           text eol=lf
++
++roms/seabios-patches/*.patch whitespace=-blank-at-eol,-blank-at-eof
+diff --git a/.gitignore b/.gitignore
+index 61fa39967b..19dcf5f489 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -20,3 +20,5 @@ GTAGS
+ *.swp
+ *.patch
+ *.gcov
++
++!roms/seabios-patches/*.patch
+diff --git a/hw/nvme/ctrl.c b/hw/nvme/ctrl.c
+index c35dd81273..ab3f6f080f 100644
+--- a/hw/nvme/ctrl.c
++++ b/hw/nvme/ctrl.c
+@@ -2649,6 +2649,11 @@ typedef struct NvmeDSMAIOCB {
+     NvmeDsmRange *range;
+     unsigned int nr;
+     unsigned int idx;
++
++    QEMUIOVector mdata_iov;
++    uint8_t *mdata;
++    uint64_t mdata_offset;
++    uint64_t mdata_remaining;
+ } NvmeDSMAIOCB;
+ 
+ static void nvme_dsm_cancel(BlockAIOCB *aiocb)
+@@ -2678,6 +2683,29 @@ static const AIOCBInfo nvme_dsm_aiocb_info = {
+ 
+ static void nvme_dsm_cb(void *opaque, int ret);
+ 
++/* Keep memory bounded even for large DSM ranges and metadata formats. */
++static void nvme_dsm_pi_cb(void *opaque, int ret)
++{
++    NvmeDSMAIOCB *iocb = opaque;
++    size_t length;
++
++    if (ret < 0 || iocb->ret < 0 || !iocb->mdata_remaining) {
++        qemu_iovec_destroy(&iocb->mdata_iov);
++        g_free(iocb->mdata);
++        nvme_dsm_cb(iocb, ret);
++        return;
++    }
++
++    length = MIN(iocb->mdata_iov.size, iocb->mdata_remaining);
++    iocb->mdata_iov.iov[0].iov_len = length;
++    iocb->mdata_iov.size = length;
++    iocb->mdata_remaining -= length;
++    iocb->aiocb = blk_aio_pwritev(iocb->req->ns->blkconf.blk,
++                                iocb->mdata_offset, &iocb->mdata_iov, 0,
++                                nvme_dsm_pi_cb, iocb);
++    iocb->mdata_offset += length;
++}
++
+ static void nvme_dsm_md_cb(void *opaque, int ret)
+ {
+     NvmeDSMAIOCB *iocb = opaque;
+@@ -2695,6 +2723,29 @@ static void nvme_dsm_md_cb(void *opaque, int ret)
+     slba = le64_to_cpu(range->slba);
+     nlb = le32_to_cpu(range->nlb);
+ 
++    if (NVME_ID_NS_DPS_TYPE(ns->id_ns.dps)) {
++        size_t length = MIN(nlb, 64 * KiB / ns->lbaf.ms) * ns->lbaf.ms;
++        size_t pil = ns->id_ns.dps & NVME_ID_NS_DPS_FIRST_EIGHT ?
++            0 : ns->lbaf.ms - nvme_pi_tuple_size(ns);
++
++        /*
++         * Mark deallocated LBAs as unwritten. Zero PI contains invalid
++         * reference tags. Synthesizing the marker only while the data is a
++         * sparse zero loses it when a neighboring write allocates the extent.
++         * This is also needed when the backend ignores discard requests.
++         */
++        iocb->mdata = g_malloc0(length);
++        for (size_t pos = pil; pos < length; pos += ns->lbaf.ms) {
++            memset(iocb->mdata + pos, 0xff, nvme_pi_tuple_size(ns));
++        }
++        qemu_iovec_init(&iocb->mdata_iov, 1);
++        qemu_iovec_add(&iocb->mdata_iov, iocb->mdata, length);
++        iocb->mdata_offset = nvme_moff(ns, slba);
++        iocb->mdata_remaining = nvme_m2b(ns, nlb);
++        nvme_dsm_pi_cb(iocb, 0);
++        return;
++    }
++
+     /*
+      * Check that all block were discarded (zeroed); otherwise we do not zero
+      * the metadata.
+@@ -10155,6 +10206,26 @@ static void nvme_exit(PCIDevice *pci_dev)
+ 
+     nvme_subsys_unregister_ctrl(n->subsys, n);
+ 
++    /* Drop paths through this controller before its PCI device disappears. */
++    for (i = 1; i <= NVME_MAX_NAMESPACES; i++) {
++        NvmeCtrl *replacement = NULL;
++        ns = nvme_subsys_ns(n->subsys, i);
++        if (!ns || ns->boot_ctrl != n) {
++            continue;
++        }
++        if (ns->params.shared) {
++            for (int j = 0; j < ARRAY_SIZE(n->subsys->ctrls); j++) {
++                NvmeCtrl *ctrl = nvme_subsys_ctrl(n->subsys, j);
++                if (ctrl && !pci_is_vf(&ctrl->parent_obj) &&
++                    (i != 1 || ctrl->namespace.blkconf.bootindex < 0)) {
++                    replacement = ctrl;
++                    break;
++                }
++            }
++        }
++        nvme_ns_set_boot_controller(ns, replacement);
++    }
++
+     g_free(n->cq);
+     g_free(n->sq);
+     g_free(n->aer_reqs);
+diff --git a/hw/nvme/ns.c b/hw/nvme/ns.c
+index 5b48c36201..4befbbaf8d 100644
+--- a/hw/nvme/ns.c
++++ b/hw/nvme/ns.c
+@@ -717,6 +717,31 @@ void nvme_ns_cleanup(NvmeNamespace *ns)
+     }
+ }
+ 
++/*
++ * Namespaces are reparented to the subsystem bus during realization. Their
++ * firmware boot paths must still identify a PCI controller and the final NSID.
++ * Keep the bootindex property bound to that controller as well, so subsequent
++ * QOM changes and property release update the same entry.
++ */
++void nvme_ns_set_boot_controller(NvmeNamespace *ns, NvmeCtrl *n)
++{
++    int32_t bootindex = ns->bootindex;
++
++    object_property_del(OBJECT(ns), "bootindex");
++    ns->boot_ctrl = n;
++    snprintf(ns->bootindex_suffix, sizeof(ns->bootindex_suffix),
++             "/namespace@%" PRIx32 ",0", ns->params.nsid);
++    device_add_bootindex_property(OBJECT(ns), &ns->bootindex, "bootindex",
++                                 ns->bootindex_suffix,
++                                 n ? DEVICE(n) : DEVICE(ns));
++
++    /* Preserve the setting without advertising a missing controller. */
++    ns->bootindex = bootindex;
++    if (n && !ns->params.detached) {
++        add_boot_device_path(bootindex, DEVICE(n), ns->bootindex_suffix);
++    }
++}
++
+ static void nvme_ns_unrealize(DeviceState *dev)
+ {
+     NvmeNamespace *ns = NVME_NS(dev);
+@@ -726,6 +751,7 @@ static void nvme_ns_unrealize(DeviceState *dev)
+     nvme_ns_drain(ns);
+     nvme_ns_shutdown(ns);
+     nvme_ns_cleanup(ns);
++    nvme_ns_set_boot_controller(ns, NULL);
+ 
+     /* Symmetric with nvme_ns_realize() which sets subsys->namespaces[nsid]. */
+     if (subsys && nsid && subsys->namespaces[nsid] == ns) {
+@@ -897,7 +923,18 @@ static void nvme_ns_realize(DeviceState *dev, Error **errp)
+         return;
+     }
+ 
++    /* A controller bootindex already names namespace 1 on this path. */
++    if (nsid == 1 && n->namespace.blkconf.bootindex >= 0 &&
++        ns->bootindex >= 0) {
++        error_setg(errp, "set bootindex on the namespace, not its controller");
++        nvme_ns_cleanup(ns);
++        return;
++    }
++
+     subsys->namespaces[nsid] = ns;
++    if (nsid != 1 || n->namespace.blkconf.bootindex < 0) {
++        nvme_ns_set_boot_controller(ns, n);
++    }
+ 
+     ns->id_ns.endgid = cpu_to_le16(0x1);
+     ns->id_ns_ind.endgrpid = cpu_to_le16(0x1);
+@@ -1130,7 +1167,7 @@ static void nvme_ns_instance_init(Object *obj)
+ {
+     NvmeNamespace *ns = NVME_NS(obj);
+ 
+-    sprintf(ns->bootindex_suffix, "/namespace@%" PRIu32 ",0", ns->params.nsid);
++    sprintf(ns->bootindex_suffix, "/namespace@%" PRIx32 ",0", ns->params.nsid);
+ 
+     device_add_bootindex_property(obj, &ns->bootindex, "bootindex",
+                                   ns->bootindex_suffix, DEVICE(obj));
+diff --git a/hw/nvme/nvme.h b/hw/nvme/nvme.h
+index 4d527caa78..63119c97f7 100644
+--- a/hw/nvme/nvme.h
++++ b/hw/nvme/nvme.h
+@@ -248,6 +248,7 @@ typedef struct NvmeNamespace {
+     BlockConf    blkconf;
+     int32_t      bootindex;
+     char         bootindex_suffix[24];
++    NvmeCtrl     *boot_ctrl;
+     int64_t      size;
+     int64_t      moff;
+     NvmeIdNs     id_ns;
+@@ -415,6 +416,7 @@ int nvme_ns_setup(NvmeNamespace *ns, Error **errp);
+ void nvme_ns_drain(NvmeNamespace *ns);
+ void nvme_ns_shutdown(NvmeNamespace *ns);
+ void nvme_ns_cleanup(NvmeNamespace *ns);
++void nvme_ns_set_boot_controller(NvmeNamespace *ns, NvmeCtrl *n);
+ 
+ typedef struct NvmeAsyncEvent {
+     QTAILQ_ENTRY(NvmeAsyncEvent) entry;
+diff --git a/roms/Makefile b/roms/Makefile
+index f15189a540..927c62a49d 100644
+--- a/roms/Makefile
++++ b/roms/Makefile
+@@ -92,19 +92,33 @@ seavgabios-isavga: build-seabios-config-vga-isavga
+ seavgabios-%: build-seabios-config-vga-%
+ 	cp seabios/builds/vga-$*/vgabios.bin ../pc-bios/vgabios-$*.bin
+ 
++SEABIOS_SRC ?= seabios
++
+ build-seabios-config-%: config.%
+-	mkdir -p seabios/builds/$*
+-	cp $< seabios/builds/$*/.config
+-	$(MAKE) -C seabios \
++	mkdir -p $(SEABIOS_SRC)/builds/$*
++	cp $< $(SEABIOS_SRC)/builds/$*/.config
++	$(MAKE) -C $(SEABIOS_SRC) \
+ 		EXTRAVERSION=$(FIRMWARE_EXTRAVERSION) \
+ 		CROSS_PREFIX=$(x86_64_cross_prefix) \
+-		KCONFIG_CONFIG=$(CURDIR)/seabios/builds/$*/.config \
+-		OUT=$(CURDIR)/seabios/builds/$*/ oldnoconfig
+-	$(MAKE) -C seabios \
++		KCONFIG_CONFIG=$(abspath $(SEABIOS_SRC))/builds/$*/.config \
++		OUT=$(abspath $(SEABIOS_SRC))/builds/$*/ oldnoconfig
++	$(MAKE) -C $(SEABIOS_SRC) \
+ 		EXTRAVERSION=$(FIRMWARE_EXTRAVERSION) \
+ 		CROSS_PREFIX=$(x86_64_cross_prefix) \
+-		KCONFIG_CONFIG=$(CURDIR)/seabios/builds/$*/.config \
+-		OUT=$(CURDIR)/seabios/builds/$*/ all
++		KCONFIG_CONFIG=$(abspath $(SEABIOS_SRC))/builds/$*/.config \
++		OUT=$(abspath $(SEABIOS_SRC))/builds/$*/ all
++
++
++.PHONY: build-custom-seabios-256k
++build-custom-seabios-256k:
++	+set -eu; scratch=$$(mktemp -d); \
++	trap 'rm -rf -- "$$scratch"' EXIT; \
++	cp -a seabios "$$scratch/"; \
++	for patch in seabios-patches/*.patch; do \
++	    patch --batch --forward --fuzz=0 -d "$$scratch/seabios" -p1 < "$$patch"; \
++	done; \
++	$(MAKE) SEABIOS_SRC="$$scratch/seabios" build-seabios-config-seabios-256k; \
++	cp "$$scratch/seabios/builds/seabios-256k/bios.bin" ../pc-bios/bios-256k.bin
+ 
+ 
+ .PHONY: skiboot qboot
+diff --git a/roms/seabios-patches/0001-nvme-namespace-boot-order.patch b/roms/seabios-patches/0001-nvme-namespace-boot-order.patch
+new file mode 100644
+index 0000000000..c00d59d80d
+--- /dev/null
++++ b/roms/seabios-patches/0001-nvme-namespace-boot-order.patch
+@@ -0,0 +1,51 @@
++Description: honor individual NVMe namespace boot priorities in SeaBIOS
++ Matching only the controller PCI path assigns every namespace the priority
++ of the first boot entry on that controller. Include the actual namespace ID
++ in hexadecimal, matching QEMU firmware paths and the UEFI representation.
++Forwarded: no
++
++--- a/src/boot.c
+++++ b/src/boot.c
++@@ -316,6 +316,20 @@ int bootprio_find_pci_device(struct pci_
++     return find_prio(desc);
++ }
++ 
+++int bootprio_find_nvme_device(struct pci_device *pci, u32 nsid)
+++{
+++    if (CONFIG_CSM) {
+++        return csm_bootprio_pci(pci);
+++    }
+++    if (!CONFIG_BOOTORDER) {
+++        return -1;
+++    }
+++    char desc[256];
+++    char *p = build_pci_path(desc, sizeof(desc), "*", pci);
+++    snprintf(p, desc + sizeof(desc) - p, "/namespace@%x,0", nsid);
+++    return find_prio(desc);
+++}
+++
++ int bootprio_find_mmio_device(void *mmio)
++ {
++     if (!CONFIG_BOOTORDER)
++--- a/src/hw/nvme.c
+++++ b/src/hw/nvme.c
++@@ -311,7 +311,8 @@ nvme_probe_ns(struct nvme_ctrl *ctrl, u3
++                           ns->lba_count, ns->block_size, ns->metadata_size);
++ 
++     dprintf(3, "%s\n", desc);
++-    boot_add_hd(&ns->drive, desc, bootprio_find_pci_device(ctrl->pci));
+++    boot_add_hd(&ns->drive, desc,
+++                bootprio_find_nvme_device(ctrl->pci, ns_id));
++ 
++ free_buffer:
++     free (id);
++--- a/src/util.h
+++++ b/src/util.h
++@@ -30,6 +30,7 @@ void bcv_prepboot(void);
++ u8 is_bootprio_strict(void);
++ struct pci_device;
++ int bootprio_find_pci_device(struct pci_device *pci);
+++int bootprio_find_nvme_device(struct pci_device *pci, u32 nsid);
++ int bootprio_find_mmio_device(void *mmio);
++ int bootprio_find_scsi_device(struct pci_device *pci, int target, int lun);
++ int bootprio_find_scsi_mmio_device(void *mmio, int target, int lun);
+diff --git a/roms/seabios-patches/0002-nvme-metadata.patch b/roms/seabios-patches/0002-nvme-metadata.patch
+new file mode 100644
+index 0000000000..faeb4e77a3
+--- /dev/null
++++ b/roms/seabios-patches/0002-nvme-metadata.patch
+@@ -0,0 +1,39 @@
++Description: keep unsupported NVMe metadata out of SeaBIOS disk I/O
++ SeaBIOS issues NVMe reads with a null metadata pointer. A namespace carrying
++ metadata can therefore DMA into low memory while its partition table is
++ probed, corrupting the interrupt vectors and BIOS data used to boot other
++ devices. Skip metadata namespaces in firmware, leaving access to guest
++ drivers with the required metadata support. Add a TCG boot regression with
++ an unsupported namespace ahead of a conventional boot disk.
++Forwarded: no
++
++--- a/src/hw/nvme.c
+++++ b/src/hw/nvme.c
++@@ -260,6 +260,18 @@ nvme_probe_ns(struct nvme_ctrl *ctrl, u3
++         goto free_buffer;
++     }
++ 
+++    struct nvme_lba_format *fmt = &id->lbaf[current_lba_format];
+++    if (fmt->ms) {
+++        /*
+++         * INT 13h has no metadata buffer. Passing a null MPTR would DMA
+++         * metadata into the interrupt vectors and BIOS data area, even
+++         * when booting from another device. Leave this namespace to the OS.
+++         */
+++        dprintf(1, "NVMe NS %u: unsupported %u-byte metadata\n",
+++                ns_id, fmt->ms);
+++        goto free_buffer;
+++    }
+++
++     if (!nvme_dma_buffer) {
++         nvme_dma_buffer = zalloc_page_aligned(&ZoneHigh, NVME_PAGE_SIZE);
++         if (!nvme_dma_buffer) {
++@@ -278,8 +290,6 @@ nvme_probe_ns(struct nvme_ctrl *ctrl, u3
++     ns->ns_id = ns_id;
++     ns->lba_count = id->nsze;
++ 
++-    struct nvme_lba_format *fmt = &id->lbaf[current_lba_format];
++-
++     ns->block_size    = 1U << fmt->lbads;
++     ns->metadata_size = fmt->ms;
++ 
+diff --git a/tests/qtest/bios-tables-test.c b/tests/qtest/bios-tables-test.c
+index a5a5b8807b..d7f3acbe68 100644
+--- a/tests/qtest/bios-tables-test.c
++++ b/tests/qtest/bios-tables-test.c
+@@ -2695,6 +2695,41 @@ static void test_acpi_loongarch64_virt_oem_fields(void)
+     g_free(args);
+ }
+ 
++static void test_nvme_metadata_boot(void)
++{
++    g_autofree char *disk = g_build_filename(g_get_tmp_dir(),
++                                            "nvme-boot-XXXXXX", NULL);
++    QTestState *qts;
++    int64_t deadline;
++    uint16_t signature;
++
++    g_assert_cmpint(boot_sector_init(disk), ==, 0);
++    qts = qtest_initf("-machine q35 -accel tcg -accel kvm "
++                     "-drive if=none,id=boot,file=%s,format=raw "
++                     "-device ide-hd,drive=boot,bootindex=2 "
++                     "-blockdev driver=null-co,node-name=meta,size=67108864,"
++                     "read-zeroes=on "
++                     "-device nvme,id=nvme,serial=metadata "
++                     "-device nvme-ns,drive=meta,bus=nvme,ms=65535,bootindex=1",
++                     disk);
++
++    deadline = g_get_monotonic_time() + 30 * G_TIME_SPAN_SECOND;
++    do {
++        /* The boot-sector helper writes 0xdead at 0x7c10. */
++        signature = qtest_readw(qts, 0x7c10);
++        if (signature == 0xdead) {
++            break;
++        }
++        g_usleep(10000);
++    } while (g_get_monotonic_time() < deadline);
++
++    g_assert_cmphex(signature, ==, 0xdead);
++    /* A metadata DMA to address zero must not erase conventional RAM size. */
++    g_assert_cmpuint(qtest_readw(qts, 0x413), >, 0);
++    qtest_quit(qts);
++    boot_sector_cleanup(disk);
++}
++
+ int main(int argc, char *argv[])
+ {
+     const char *arch = qtest_get_arch();
+@@ -2897,6 +2932,10 @@ int main(int argc, char *argv[])
+                            test_acpi_loongarch64_virt_oem_fields);
+         }
+     }
++    if (qtest_has_machine("q35") && qtest_has_device("nvme-ns")) {
++        qtest_add_func("boot/nvme-metadata", test_nvme_metadata_boot);
++    }
++
+     ret = g_test_run();
+     boot_sector_cleanup(disk);
+     return ret;
+diff --git a/tests/qtest/boot-order-test.c b/tests/qtest/boot-order-test.c
+index 74d6b82dd2..1805bbdb8f 100644
+--- a/tests/qtest/boot-order-test.c
++++ b/tests/qtest/boot-order-test.c
+@@ -12,6 +12,7 @@
+ 
+ #include "qemu/osdep.h"
+ #include "libqos/fw_cfg.h"
++#include "libqos/pci.h"
+ #include "libqtest.h"
+ #include "qobject/qdict.h"
+ #include "standard-headers/linux/qemu_fw_cfg.h"
+@@ -60,6 +61,129 @@ static void test_boot_orders(const char *machine,
+     }
+ }
+ 
++typedef struct {
++    const char *name;
++    const char *args;
++    const char *expected;
++} NvmeBootPathTest;
++
++#define NVME_BOOT_CTRL "/pci@i0cf8/pci1b36,0010@4"
++#define NVME_BOOT_ARGS "-device nvme-subsys,id=ss " \
++    "-device nvme,id=ctrl,subsys=ss,serial=boot,addr=04,use-intel-id=off "
++
++static void assert_nvme_boot_path(QTestState *qts, const char *expected)
++{
++    g_autoptr(QFWCFG) fw_cfg = io_fw_cfg_init(qts, 0x510);
++    g_autofree char *expected_path = g_strdup(expected);
++    char order[1024] = { 0 };
++    size_t size = qfw_cfg_get_file(fw_cfg, "bootorder", order, sizeof(order));
++
++    g_assert_cmpuint(size, <=, sizeof(order));
++    g_strchomp(order);
++    g_strchomp(expected_path);
++    g_assert_cmpstr(order, ==, expected_path);
++}
++
++static void test_nvme_boot_path(const void *opaque)
++{
++    const NvmeBootPathTest *test = opaque;
++    QTestState *qts = qtest_initf(
++        "-M q35 -nodefaults -blockdev driver=null-co,node-name=disk,size=16777216 %s",
++        test->args);
++
++    assert_nvme_boot_path(qts, test->expected);
++    qtest_system_reset(qts);
++    assert_nvme_boot_path(qts, test->expected);
++    qtest_quit(qts);
++}
++
++static const NvmeBootPathTest nvme_boot_path_tests[] = {
++    { "legacy",
++      "-device nvme,drive=disk,serial=boot,addr=04,use-intel-id=off,bootindex=1",
++      NVME_BOOT_CTRL "/namespace@1,0\n" },
++    { "controller-index",
++      "-device nvme-subsys,id=ss "
++      "-device nvme,id=ctrl,subsys=ss,serial=boot,addr=04,"
++      "use-intel-id=off,bootindex=1 "
++      "-device nvme-ns,id=ns,bus=ctrl,drive=disk,nsid=1",
++      NVME_BOOT_CTRL "/namespace@1,0\n" },
++    { "shared", NVME_BOOT_ARGS
++      "-device nvme-ns,id=ns,bus=ctrl,drive=disk,nsid=10,bootindex=1",
++      NVME_BOOT_CTRL "/namespace@a,0\n" },
++    { "private", NVME_BOOT_ARGS
++      "-device nvme-ns,id=ns,bus=ctrl,drive=disk,nsid=256,shared=off,bootindex=1",
++      NVME_BOOT_CTRL "/namespace@100,0\n" },
++    { "automatic-nsid", NVME_BOOT_ARGS
++      "-device nvme-ns,id=ns,bus=ctrl,drive=disk,bootindex=1",
++      NVME_BOOT_CTRL "/namespace@1,0\n" },
++    { "multipath", NVME_BOOT_ARGS
++      "-device nvme,id=path1,subsys=ss,serial=boot,addr=05,use-intel-id=off "
++      "-device nvme-ns,id=ns,bus=path1,drive=disk,nsid=10,bootindex=1",
++      "/pci@i0cf8/pci1b36,0010@5/namespace@a,0\n" },
++    { "detached", NVME_BOOT_ARGS
++      "-device nvme-ns,id=ns,bus=ctrl,drive=disk,nsid=10,detached=on,bootindex=1",
++      "" },
++    { "multiple-namespaces", NVME_BOOT_ARGS
++      "-blockdev driver=null-co,node-name=disk2,size=16777216 "
++      "-device nvme-ns,id=ns1,bus=ctrl,drive=disk,nsid=2,bootindex=2 "
++      "-device nvme-ns,id=ns2,bus=ctrl,drive=disk2,nsid=10,bootindex=1",
++      NVME_BOOT_CTRL "/namespace@a,0\n"
++      NVME_BOOT_CTRL "/namespace@2,0\n" },
++};
++
++static void test_nvme_boot_path_updates(void)
++{
++    QTestState *qts = qtest_init(
++        "-M q35 -nodefaults " NVME_BOOT_ARGS
++        "-blockdev driver=null-co,node-name=disk,size=16777216 "
++        "-device nvme-ns,id=ns,bus=ctrl,drive=disk,nsid=10,bootindex=1");
++
++    qtest_qmp_assert_success(qts,
++        "{ 'execute': 'qom-set', 'arguments': { 'path': '/machine/peripheral/ns',"
++        " 'property': 'bootindex', 'value': 3 } }");
++    qtest_system_reset(qts);
++    assert_nvme_boot_path(qts, NVME_BOOT_CTRL "/namespace@a,0\n");
++
++    qtest_qmp_assert_success(qts,
++        "{ 'execute': 'qom-set', 'arguments': { 'path': '/machine/peripheral/ns',"
++        " 'property': 'bootindex', 'value': -1 } }");
++    qtest_system_reset(qts);
++    assert_nvme_boot_path(qts, "");
++
++    qtest_qmp_assert_success(qts,
++        "{ 'execute': 'qom-set', 'arguments': { 'path': '/machine/peripheral/ns',"
++        " 'property': 'bootindex', 'value': 1 } }");
++    qtest_system_reset(qts);
++    assert_nvme_boot_path(qts, NVME_BOOT_CTRL "/namespace@a,0\n");
++
++    /* QEMU 11.0 has no namespace hotplug; exercise its unrealize hook. */
++    qtest_qmp_assert_success(qts,
++        "{ 'execute': 'qom-set', 'arguments': { 'path': '/machine/peripheral/ns',"
++        " 'property': 'realized', 'value': false } }");
++    qtest_system_reset(qts);
++    assert_nvme_boot_path(qts, "");
++
++    qtest_quit(qts);
++}
++
++static void test_nvme_boot_path_controller_removal(void)
++{
++    QTestState *qts = qtest_init(
++        "-M pc -nodefaults " NVME_BOOT_ARGS
++        "-device nvme,id=path1,subsys=ss,serial=boot,addr=05,use-intel-id=off "
++        "-blockdev driver=null-co,node-name=disk,size=16777216 "
++        "-device nvme-ns,id=ns,bus=ctrl,drive=disk,nsid=10,bootindex=1");
++
++    qpci_unplug_acpi_device_test(qts, "ctrl", 4);
++    qtest_system_reset(qts);
++    assert_nvme_boot_path(qts, "/pci@i0cf8/pci1b36,0010@5/namespace@a,0\n");
++
++    qpci_unplug_acpi_device_test(qts, "path1", 5);
++    qtest_system_reset(qts);
++    assert_nvme_boot_path(qts, "");
++    qtest_quit(qts);
++}
++
+ static uint8_t read_mc146818(QTestState *qts, uint16_t port, uint8_t reg)
+ {
+     qtest_outb(qts, port, reg);
+@@ -162,6 +286,18 @@ int main(int argc, char *argv[])
+ 
+     if (strcmp(arch, "i386") == 0 || strcmp(arch, "x86_64") == 0) {
+         qtest_add_func("boot-order/pc", test_pc_boot_order);
++        if (qtest_has_machine("q35") && qtest_has_device("nvme")) {
++            for (size_t i = 0; i < G_N_ELEMENTS(nvme_boot_path_tests); i++) {
++                const NvmeBootPathTest *test = &nvme_boot_path_tests[i];
++                g_autofree char *name = g_strdup_printf("boot-order/nvme/%s",
++                                                       test->name);
++                qtest_add_data_func(name, test, test_nvme_boot_path);
++            }
++            qtest_add_func("boot-order/nvme/updates",
++                           test_nvme_boot_path_updates);
++            qtest_add_func("boot-order/nvme/controller-removal",
++                           test_nvme_boot_path_controller_removal);
++        }
+     } else if (strcmp(arch, "ppc") == 0 || strcmp(arch, "ppc64") == 0) {
+         qtest_add_func("boot-order/pmac_oldworld",
+                        test_pmac_oldworld_boot_order);
+diff --git a/tests/qtest/nvme-test.c b/tests/qtest/nvme-test.c
+index 02094d2ae0..b1a4ec0431 100644
+--- a/tests/qtest/nvme-test.c
++++ b/tests/qtest/nvme-test.c
+@@ -1029,6 +1029,138 @@ static void nvmetest_intx_reset_test(void *obj, void *data,
+     qpci_iounmap(ctrl->pdev, ctrl->bar);
+ }
+ 
++static void nvme_pi_setup_ctrl(nvme_ctrl *ctrl)
++{
++    uint64_t cap;
++
++    /* disable controller */
++    qpci_io_writel(ctrl->pdev, ctrl->bar, NVME_REG_CC, 0);
++    nvme_wait_ready(ctrl, 0);
++
++    cap = qpci_io_readq(ctrl->pdev, ctrl->bar, NVME_REG_CAP);
++    ctrl->db_stride = 4 << NVME_CAP_DSTRD(cap);
++
++    nvme_init_cq(ctrl, &ctrl->admin_cq, 1, 2 /* CQEs num */);
++    nvme_init_sq(ctrl, &ctrl->admin_sq, 0, 4 /* SQEs num */, &ctrl->admin_cq);
++
++    qpci_io_writel(ctrl->pdev, ctrl->bar, NVME_REG_AQA,
++        ((ctrl->admin_cq.common.size - 1) << AQA_ACQS_SHIFT) |
++        ((ctrl->admin_sq.common.size - 1) << AQA_ASQS_SHIFT)
++    );
++
++    qpci_io_writeq(ctrl->pdev, ctrl->bar,
++                   NVME_REG_ASQ, (uint64_t)ctrl->admin_sq.phys_sqe);
++    qpci_io_writeq(ctrl->pdev, ctrl->bar,
++                   NVME_REG_ACQ, (uint64_t)ctrl->admin_cq.phys_cqe);
++
++    /* enable controller */
++    {
++        uint32_t cc = 0;
++        NVME_SET_CC_EN(cc, 1);
++        qpci_io_writel(ctrl->pdev, ctrl->bar, NVME_REG_CC, cc);
++    }
++
++    nvme_wait_ready(ctrl, 1);
++}
++
++static void nvme_pi_image_destroy(void *opaque)
++{
++    g_unlink(opaque);
++    g_free(opaque);
++    qos_invalidate_command_line();
++}
++
++static void *nvme_pi_test_setup(GString *cmd_line, void *arg)
++{
++    char *path;
++    int fd = g_file_open_tmp("nvme-pi-XXXXXX", &path, NULL);
++
++    g_assert_cmpint(fd, >=, 0);
++    g_assert_cmpint(ftruncate(fd, 8 * MiB), ==, 0);
++    close(fd);
++    g_test_queue_destroy(nvme_pi_image_destroy, path);
++
++    g_string_append_printf(cmd_line,
++        " -drive if=none,id=pi-drive,file=%s,format=raw,discard=%s"
++        " -device nvme-ns,drive=pi-drive,bus=pi-ctrl,nsid=2,ms=8,pi=1",
++        path, arg ? "unmap" : "ignore");
++    return NULL;
++}
++
++static void nvmetest_pi_discard(void *obj, void *data, QGuestAllocator *alloc)
++{
++    QNvme *nvme = obj;
++    nvme_ctrl ctrl = { .alloc = alloc, .pdev = &nvme->dev };
++    nvme_cq cq;
++    nvme_sq sq;
++    NvmeCqe cqe;
++    /* Cross the 64 KiB metadata chunk boundary with a partial final chunk. */
++    NvmeDsmRange range = { .nlb = cpu_to_le32(8201),
++                           .slba = cpu_to_le64(128) };
++    uint64_t buffer = guest_alloc(alloc, 4096);
++    uint64_t command;
++    QTestState *qts = ctrl.pdev->bus->qts;
++
++    qpci_device_enable(ctrl.pdev);
++    ctrl.bar = qpci_iomap(ctrl.pdev, 0, NULL);
++    nvme_pi_setup_ctrl(&ctrl);
++    qpci_io_writel(ctrl.pdev, ctrl.bar, NVME_REG_CC, 0x00460001);
++    nvme_init_cq(&ctrl, &cq, 3, 16);
++    nvme_init_sq(&ctrl, &sq, 2, 16, &cq);
++
++    command = nvme_get_next_sqe(&ctrl.admin_sq, NVME_ADM_CMD_CREATE_CQ,
++                                1, cq.phys_cqe);
++    qtest_writel(qts, command + 40, (15 << 16) | 1);
++    qtest_writel(qts, command + 44, 1);
++    nvme_commit_sqe(&ctrl.admin_sq);
++    cqe = nvme_wait(&ctrl.admin_sq);
++    g_assert(nvme_is_cqe_success(&cqe));
++
++    command = nvme_get_next_sqe(&ctrl.admin_sq, NVME_ADM_CMD_CREATE_SQ,
++                                2, sq.phys_sqe);
++    qtest_writel(qts, command + 40, (15 << 16) | 1);
++    qtest_writel(qts, command + 44, (1 << 16) | 1);
++    nvme_commit_sqe(&ctrl.admin_sq);
++    cqe = nvme_wait(&ctrl.admin_sq);
++    g_assert(nvme_is_cqe_success(&cqe));
++
++    qtest_memwrite(qts, buffer, &range, sizeof(range));
++    command = nvme_get_next_sqe(&sq, NVME_CMD_DSM, 3, buffer);
++    qtest_writel(qts, command + 4, 2);
++    qtest_writel(qts, command + 44, NVME_DSMGMT_AD);
++    nvme_commit_sqe(&sq);
++    cqe = nvme_wait(&sq);
++    g_assert(nvme_is_cqe_success(&cqe));
++
++    /* Allocate the host extent containing the adjacent, unwritten LBA. */
++    qtest_memset(qts, buffer, 0x5a, 512);
++    command = nvme_get_next_sqe(&sq, NVME_CMD_WRITE, 4, buffer);
++    qtest_writel(qts, command + 4, 2);
++    qtest_writeq(qts, command + 40, 128);
++    qtest_writel(qts, command + 48, NVME_RW_PRINFO_PRACT << 16);
++    qtest_writel(qts, command + 56, 128);
++    nvme_commit_sqe(&sq);
++    cqe = nvme_wait(&sq);
++    g_assert(nvme_is_cqe_success(&cqe));
++
++    command = nvme_get_next_sqe(&sq, NVME_CMD_READ, 5, buffer);
++    qtest_writel(qts, command + 4, 2);
++    qtest_writeq(qts, command + 40, 129);
++    qtest_writel(qts, command + 48,
++        (NVME_RW_PRINFO_PRACT | NVME_RW_PRINFO_PRCHK_REF) << 16);
++    qtest_writel(qts, command + 56, 129);
++    nvme_commit_sqe(&sq);
++    cqe = nvme_wait(&sq);
++    g_assert(nvme_is_cqe_success(&cqe));
++
++    qpci_iounmap(ctrl.pdev, ctrl.bar);
++    guest_free(alloc, buffer);
++    guest_free(alloc, sq.phys_sqe);
++    guest_free(alloc, cq.phys_cqe);
++    guest_free(alloc, ctrl.admin_sq.phys_sqe);
++    guest_free(alloc, ctrl.admin_cq.phys_cqe);
++}
++
+ static void nvme_register_nodes(void)
+ {
+     QOSGraphEdgeOptions opts = {
+@@ -1056,6 +1188,18 @@ static void nvme_register_nodes(void)
+ 
+     qos_add_test("reg-read", "nvme", nvmetest_reg_read_test, NULL);
+ 
++    qos_add_test("pi-discard-unmap", "nvme", nvmetest_pi_discard,
++        &(QOSGraphTestOptions) {
++            .before = nvme_pi_test_setup,
++            .arg = GINT_TO_POINTER(1),
++            .edge.extra_device_opts = "id=pi-ctrl",
++        });
++    qos_add_test("pi-discard-ignore", "nvme", nvmetest_pi_discard,
++        &(QOSGraphTestOptions) {
++            .before = nvme_pi_test_setup,
++            .edge.extra_device_opts = "id=pi-ctrl",
++        });
++
+     qos_add_test("migrate", "nvme", test_migrate, NULL);
+ 
+     qos_add_test("intx-cq-db-redundant", "nvme",

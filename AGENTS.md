@@ -6,8 +6,8 @@ individual features in their patches, tests, and relevant product documentation.
 ## Layout
 
 - This repository packages Proxmox VE's QEMU as `pve-qemu-kvm`.
-- `qemu/` is the pinned upstream submodule. Device models, block storage,
-  migration, tests, and firmware live under its corresponding source directories.
+- `qemu/` is pinned to the upstream QEMU 11.0.3 release (`aeec49e8`). The
+  adjacent standalone QEMU repository holds the custom hardware branches.
 - `debian/patches/` contains quilt patches; `series` defines their application
   order. Preserve the existing `extra/`, `bitmap-mirror/`, and `pve/` organization.
 - Root `Makefile` prepares sources and builds packages; `debian/rules` configures
@@ -20,21 +20,42 @@ individual features in their patches, tests, and relevant product documentation.
 
 - Inspect `git status` and submodule status first. Preserve unrelated changes and
   untracked files, and keep work within the requested scope.
-- Maintain QEMU changes as patches in `debian/patches/` and register them in
-  `series`. Include regression tests in the patch set. Changes left only in a
-  prepared build tree will be lost; changes left only in the submodule are not
-  included in the packaging repository's commit.
-- Number repository-specific patches from `9000`; preserve upstream numbering.
+- Maintain custom code and regression tests on feature branches in the standalone
+  QEMU repository. Start each `v11.0.3_hw/` feature branch from the upstream
+  11.0.3 release and merge only its prerequisites. Import earlier
+  `v11.0.1_feat/` features at the `v11.0.3_hw/custom` integration level.
+  Resolve cross-feature overlaps in `custom` and export its integrated states
+  as patches numbered `9000` and later. Keep official patches under `extra/`, `bitmap-mirror/`,
+  and `pve/0001`–`0050` in their original order and preserve their contents.
 - Update pinned submodule revisions as part of intended upstream updates, not
   as a workaround for patch failures. Verify the complete patch sequence applies.
 - Follow surrounding QEMU C and Perl conventions. Run QEMU's
-  `scripts/checkpatch.pl` on changed patches and review its findings; use
+  `scripts/checkpatch.pl --no-signoff` on changed patches and review its findings.
+  Keep the literal unified-diff context in nested firmware patches. Use
   `perl -c` for changed packaging helpers with their dependencies installed.
 - Preserve QAPI, machine-version, migration, saved-state, and disk-format
   compatibility. Cover both configured targets, x86_64 and aarch64, where affected.
 - Keep build trees, packages, logs, temporary images, and IDE files out of
   commits. Preserve tracked fixtures and capability baselines.
 - Prepare Linux/WSL source copies with LF line endings and Git executable modes.
+
+## Exporting custom patches
+
+- Follow the integration order in the `series` file. Each custom patch records
+  its exact QEMU revisions in `X-QEMU-Base-Commit` and `X-QEMU-Commit`. Use
+  successive states on the integration branch, including merge commits, so the
+  diffs capture any resolutions between feature branches.
+- For each group, update the revision headers and replace the diff body with
+  `git -C <standalone-qemu> diff --no-ext-diff --no-renames --binary <base> <tip>`.
+  Keep the upstream submodule revision as the first base and pass each tip to
+  the next group. Add a custom series entry for a new feature group.
+- Apply the entire series in a clean, temporary Linux source tree with
+  `QUILT_PATCHES=debian/patches QUILT_PATCH_OPTS=--fuzz=0 quilt push -a`.
+  Use that tree to check interactions with official Proxmox patches. Verify the
+  official patch files and their series entries against the starting revision.
+- Maintain the SeaBIOS source patches with the NVMe feature in QEMU. The
+  generated NVMe patch carries them and `build-custom-seabios-256k` applies
+  them to a temporary firmware source copy before building the packaged BIOS.
 
 ## Build and validation
 

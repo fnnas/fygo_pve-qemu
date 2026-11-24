@@ -1,13 +1,10 @@
-Description: enforce eMMC partition isolation and RPMB frame bounds
- Check regular reads, writes and erases against the selected partition instead
- of the USER area. Reject RPMB accesses through unauthenticated single-block
- and erase commands. Validate authenticated RPMB frame addresses and the full
- read block count before accessing storage so requests cannot expose or
- overwrite the adjacent USER area. Invalid writes preserve the write counter.
- Add protocol regressions for partition ends, multi-block overflow and RPMB
- command restrictions.
+Description: eMMC partition access, SDHCI reset and configurable CID
 Forwarded: no
+X-QEMU-Base-Commit: b97c3add402c5e211d2257ffd92fedc9434241cb
+X-QEMU-Commit: 2b1f1f125a13c4201cb93e4f1140e43251e4cbf2
 
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 296a9c7697..c24385bb33 100644
 --- a/MAINTAINERS
 +++ b/MAINTAINERS
 @@ -2310,6 +2310,7 @@ F: include/hw/sd/sd*
@@ -18,9 +15,67 @@ Forwarded: no
  F: tests/qtest/fuzz-sdcard-test.c
  F: tests/qtest/sdhci-test.c
  
+diff --git a/docs/system/devices/emmc.rst b/docs/system/devices/emmc.rst
+index e62adfd68e..397e7c393f 100644
+--- a/docs/system/devices/emmc.rst
++++ b/docs/system/devices/emmc.rst
+@@ -53,3 +53,27 @@ SDHCI controllers while assuming that the firmware needs a boot partitions of
+     -drive file=emmc.img,if=none,format=raw,id=emmc-img
+     -device sdhci-pci
+     -device emmc,drive=emmc-img,boot-partition-size=1048576,rpmb-partition-size=2097152
++
++Custom Card Identification
++==========================
++
++The optional ``cid`` property sets the 128-bit card identification register.
++Provide exactly 32 hexadecimal characters, without a ``0x`` prefix or spaces.
++Both uppercase and lowercase are accepted. When omitted, the existing QEMU
++identity is used. This property is specific to eMMC and does not change SD cards.
++For example, add the following property to the eMMC device:
++
++.. code-block:: console
++
++    -device emmc,drive=emmc-img,cid=15010043494431323310012345672900
++
++The value is reapplied on device reset. Configure the same value on migration
++endpoints; the existing CID migration state is unchanged. Changing CID does not
++modify the backing image. A realized device's CID property cannot be changed.
++
++SDHCI omits the final CRC/end-bit byte from its 136-bit response registers.
++Consequently Linux's ``/sys/block/mmcblk0/device/cid`` reports that last byte as
++``00``, regardless of the property's last two hexadecimal characters. The other
++15 bytes match the configured value. Values copied from Linux sysfs can be used
++directly, including their final ``00``; QEMU does not validate or regenerate the
++CRC byte of a custom CID.
+diff --git a/hw/sd/sd.c b/hw/sd/sd.c
+index 37f6e0702b..7738736704 100644
 --- a/hw/sd/sd.c
 +++ b/hw/sd/sd.c
-@@ -892,6 +892,30 @@ static uint32_t sd_part_offset(SDState *
+@@ -147,6 +147,7 @@ struct SDState {
+     uint32_t ocr;
+     uint8_t scr[8];
+     uint8_t cid[16];
++    char *cid_config;
+     uint8_t csd[16];
+     uint16_t rca;
+     uint32_t card_status;
+@@ -480,6 +481,15 @@ static void sd_set_cid(SDState *sd)
+ 
+ static void emmc_set_cid(SDState *sd)
+ {
++    if (sd->cid_config) {
++        /* Validated before realize; restore the configured CID on reset. */
++        for (unsigned i = 0; i < sizeof(sd->cid); i++) {
++            sd->cid[i] = (g_ascii_xdigit_value(sd->cid_config[2 * i]) << 4) |
++                         g_ascii_xdigit_value(sd->cid_config[2 * i + 1]);
++        }
++        return;
++    }
++
+     sd->cid[0] = MID;       /* Fake card manufacturer ID (MID) */
+     sd->cid[1] = 0b01;      /* CBX: soldered BGA */
+     sd->cid[2] = OID[0];    /* OEM/Application ID (OID) */
+@@ -892,6 +902,30 @@ static uint32_t sd_part_offset(SDState *sd)
      }
  }
  
@@ -51,7 +106,7 @@ Forwarded: no
  static uint64_t sd_req_get_address(SDState *sd, SDRequest req)
  {
      uint64_t addr;
-@@ -1196,6 +1220,14 @@ static bool rpmb_calc_hmac(SDState *sd,
+@@ -1196,12 +1230,31 @@ static bool rpmb_calc_hmac(SDState *sd, const RPMBDataFrame *frame,
      return success;
  }
  
@@ -66,10 +121,10 @@ Forwarded: no
  static void emmc_rpmb_blk_read(SDState *sd, uint64_t addr, uint32_t len)
  {
      uint16_t resp = lduw_be_p(&sd->rpmb.result.req_resp);
-@@ -1203,6 +1235,17 @@ static void emmc_rpmb_blk_read(SDState *
+     uint16_t result = lduw_be_p(&sd->rpmb.result.result);
      unsigned int curr_block = 0;
  
-     if ((result & ~RPMB_RESULT_COUTER_EXPIRED) == RPMB_RESULT_OK &&
++    if ((result & ~RPMB_RESULT_COUTER_EXPIRED) == RPMB_RESULT_OK &&
 +        resp == RPMB_RESP(RPMB_REQ_AUTH_DATA_READ) &&
 +        sd->rpmb.result.block_count == 0 &&
 +        !emmc_rpmb_range_valid(sd, lduw_be_p(&sd->rpmb.result.address),
@@ -80,11 +135,10 @@ Forwarded: no
 +        memset(sd->rpmb.result.data, 0, sizeof(sd->rpmb.result.data));
 +    }
 +
-+    if ((result & ~RPMB_RESULT_COUTER_EXPIRED) == RPMB_RESULT_OK &&
+     if ((result & ~RPMB_RESULT_COUTER_EXPIRED) == RPMB_RESULT_OK &&
          resp == RPMB_RESP(RPMB_REQ_AUTH_DATA_READ)) {
          curr_block = lduw_be_p(&sd->rpmb.result.address);
-         if (sd->rpmb.result.block_count == 0) {
-@@ -1289,6 +1332,11 @@ static void emmc_rpmb_blk_write(SDState
+@@ -1289,6 +1342,11 @@ static void emmc_rpmb_blk_write(SDState *sd, uint64_t addr, uint32_t len)
              stw_be_p(&sd->rpmb.result.result, RPMB_RESULT_COUNTER_FAILURE);
              break;
          }
@@ -96,7 +150,7 @@ Forwarded: no
          sd->rpmb.result.address = frame->address;
          addr = lduw_be_p(&frame->address) * RPMB_DATA_LEN + sd_part_offset(sd);
          if (blk_pwrite(sd->blk, addr, RPMB_DATA_LEN, frame->data, 0) < 0) {
-@@ -1340,7 +1388,8 @@ static void sd_erase(SDState *sd)
+@@ -1340,7 +1398,8 @@ static void sd_erase(SDState *sd)
          sdsc = false;
      }
  
@@ -106,7 +160,17 @@ Forwarded: no
          sd->card_status |= OUT_OF_RANGE;
          sd->erase_start = INVALID_ADDRESS;
          sd->erase_end = INVALID_ADDRESS;
-@@ -1555,10 +1604,16 @@ static void sd_lock_command(SDState *sd)
+@@ -1431,7 +1490,8 @@ static void emmc_function_switch(SDState *sd, uint32_t arg)
+     if (index == EXT_CSD_PART_CONFIG) {
+         uint8_t part = b & EXT_CSD_PART_CONFIG_ACC_MASK;
+ 
+-        if (((part == EXT_CSD_PART_CONFIG_ACC_BOOT1 ||
++        if (part > EXT_CSD_PART_CONFIG_ACC_RPMB ||
++            ((part == EXT_CSD_PART_CONFIG_ACC_BOOT1 ||
+               part == EXT_CSD_PART_CONFIG_ACC_BOOT2) && !sd->boot_part_size) ||
+             (part == EXT_CSD_PART_CONFIG_ACC_RPMB && !sd->rpmb_part_size)) {
+             qemu_log_mask(LOG_GUEST_ERROR,
+@@ -1555,10 +1615,16 @@ static void sd_lock_command(SDState *sd)
  static bool address_in_range(SDState *sd, const char *desc,
                               uint64_t addr, uint32_t length)
  {
@@ -126,7 +190,7 @@ Forwarded: no
          sd->card_status |= ADDRESS_ERROR;
          return false;
      }
-@@ -1975,6 +2030,9 @@ static sd_rsp_type_t sd_cmd_READ_SINGLE_
+@@ -1975,6 +2041,9 @@ static sd_rsp_type_t sd_cmd_READ_SINGLE_BLOCK(SDState *sd, SDRequest req)
  {
      uint64_t addr;
  
@@ -136,7 +200,7 @@ Forwarded: no
      if (sd->state != sd_transfer_state) {
          return sd_invalid_state_for_cmd(sd, req);
      }
-@@ -2025,6 +2083,9 @@ static sd_rsp_type_t sd_cmd_WRITE_SINGLE
+@@ -2025,6 +2094,9 @@ static sd_rsp_type_t sd_cmd_WRITE_SINGLE_BLOCK(SDState *sd, SDRequest req)
  {
      uint64_t addr;
  
@@ -146,7 +210,7 @@ Forwarded: no
      if (sd->state != sd_transfer_state) {
          return sd_invalid_state_for_cmd(sd, req);
      }
-@@ -2127,6 +2188,9 @@ static sd_rsp_type_t sd_cmd_SEND_WRITE_P
+@@ -2127,6 +2199,9 @@ static sd_rsp_type_t sd_cmd_SEND_WRITE_PROT(SDState *sd, SDRequest req)
  /* CMD32 */
  static sd_rsp_type_t sd_cmd_ERASE_WR_BLK_START(SDState *sd, SDRequest req)
  {
@@ -156,7 +220,7 @@ Forwarded: no
      if (sd->state != sd_transfer_state) {
          return sd_invalid_state_for_cmd(sd, req);
      }
-@@ -2137,6 +2201,9 @@ static sd_rsp_type_t sd_cmd_ERASE_WR_BLK
+@@ -2137,6 +2212,9 @@ static sd_rsp_type_t sd_cmd_ERASE_WR_BLK_START(SDState *sd, SDRequest req)
  /* CMD33 */
  static sd_rsp_type_t sd_cmd_ERASE_WR_BLK_END(SDState *sd, SDRequest req)
  {
@@ -166,7 +230,7 @@ Forwarded: no
      if (sd->state != sd_transfer_state) {
          return sd_invalid_state_for_cmd(sd, req);
      }
-@@ -2147,6 +2214,9 @@ static sd_rsp_type_t sd_cmd_ERASE_WR_BLK
+@@ -2147,6 +2225,9 @@ static sd_rsp_type_t sd_cmd_ERASE_WR_BLK_END(SDState *sd, SDRequest req)
  /* CMD38 */
  static sd_rsp_type_t sd_cmd_ERASE(SDState *sd, SDRequest req)
  {
@@ -176,7 +240,7 @@ Forwarded: no
      if (sd->state != sd_transfer_state) {
          return sd_invalid_state_for_cmd(sd, req);
      }
-@@ -2371,6 +2441,10 @@ static sd_rsp_type_t sd_normal_command(S
+@@ -2371,6 +2452,10 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
          switch (sd->state) {
          case sd_transfer_state:
  
@@ -187,9 +251,76 @@ Forwarded: no
              if (!address_in_range(sd, "READ_BLOCK", addr, sd->blk_len)) {
                  return sd_r1;
              }
+@@ -3138,6 +3223,21 @@ static void emmc_realize(DeviceState *dev, Error **errp)
+ {
+     SDState *sd = SDMMC_COMMON(dev);
+ 
++    if (sd->cid_config) {
++        if (strlen(sd->cid_config) != 2 * sizeof(sd->cid)) {
++            error_setg(errp,
++                       "eMMC cid must contain exactly 32 hexadecimal characters");
++            return;
++        }
++        for (unsigned i = 0; i < 2 * sizeof(sd->cid); i++) {
++            if (!g_ascii_isxdigit(sd->cid_config[i])) {
++                error_setg(errp,
++                           "eMMC cid must contain exactly 32 hexadecimal characters");
++                return;
++            }
++        }
++    }
++
+     sd->spec_version = SD_PHY_SPECv3_01_VERS; /* Actually v4.5 */
+ 
+     sd_realize(dev, errp);
+@@ -3153,6 +3253,7 @@ static const Property sd_properties[] = {
+ };
+ 
+ static const Property emmc_properties[] = {
++    DEFINE_PROP_STRING("cid", SDState, cid_config),
+     DEFINE_PROP_UINT64("boot-partition-size", SDState, boot_part_size, 0),
+     DEFINE_PROP_UINT8("boot-config", SDState, boot_config, 0x0),
+     DEFINE_PROP_UINT64("rpmb-partition-size", SDState, rpmb_part_size, 0),
+diff --git a/hw/sd/sdhci.c b/hw/sd/sdhci.c
+index c86dfa281f..04816b15fc 100644
+--- a/hw/sd/sdhci.c
++++ b/hw/sd/sdhci.c
+@@ -1149,15 +1149,15 @@ static inline void sdhci_blkgap_write(SDHCIState *s, uint8_t value)
+ 
+ static inline void sdhci_reset_write(SDHCIState *s, uint8_t value)
+ {
+-    switch (value) {
+-    case SDHC_RESET_ALL:
++    if (value & SDHC_RESET_ALL) {
+         sdhci_reset(s);
+-        break;
+-    case SDHC_RESET_CMD:
++        return;
++    }
++    if (value & SDHC_RESET_CMD) {
+         s->prnsts &= ~SDHC_CMD_INHIBIT;
+         s->norintsts &= ~SDHC_NIS_CMDCMP;
+-        break;
+-    case SDHC_RESET_DATA:
++    }
++    if (value & SDHC_RESET_DATA) {
+         s->data_count = 0;
+         s->prnsts &= ~(SDHC_SPACE_AVAILABLE | SDHC_DATA_AVAILABLE |
+                 SDHC_DOING_READ | SDHC_DOING_WRITE |
+@@ -1166,7 +1166,6 @@ static inline void sdhci_reset_write(SDHCIState *s, uint8_t value)
+         s->stopped_state = sdhc_not_stopped;
+         s->norintsts &= ~(SDHC_NIS_WBUFRDY | SDHC_NIS_RBUFRDY |
+                 SDHC_NIS_DMA | SDHC_NIS_TRSCMP | SDHC_NIS_BLKGAP);
+-        break;
+     }
+ }
+ 
+diff --git a/tests/qtest/emmc-test.c b/tests/qtest/emmc-test.c
+new file mode 100644
+index 0000000000..6a642cfecb
 --- /dev/null
 +++ b/tests/qtest/emmc-test.c
-@@ -0,0 +1,320 @@
+@@ -0,0 +1,475 @@
 +/*
 + * eMMC partition isolation and RPMB access regressions.
 + * SPDX-License-Identifier: GPL-2.0-or-later
@@ -197,6 +328,7 @@ Forwarded: no
 +
 +#include "qemu/osdep.h"
 +#include "qemu/bswap.h"
++#include "qobject/qdict.h"
 +#include "libqtest.h"
 +#include "libqos/pci-pc.h"
 +#include "hw/pci/pci.h"
@@ -286,8 +418,10 @@ Forwarded: no
 +    stw_be_p(frame + FRAME_REQUEST, request);
 +}
 +
-+static void emmc_init(EMMCTest *s)
++static void emmc_init_with_cid(EMMCTest *s, const char *cid)
 +{
++    g_autofree char *cid_option = cid ? g_strdup_printf(",cid=%s", cid) :
++                                     g_strdup("");
 +    uint8_t sentinel[FRAME_SIZE];
 +    uint8_t frame[FRAME_SIZE];
 +    uint32_t ocr = 0;
@@ -300,10 +434,10 @@ Forwarded: no
 +                    ==, sizeof(sentinel));
 +    s->qts = qtest_initf("-machine pc -nodefaults "
 +                        "-device sdhci-pci,id=sdhci,addr=04.0,sd-spec-version=3 "
-+                        "-device emmc,drive=d0,boot-partition-size=%u,"
-+                        "rpmb-partition-size=%u "
++                        "-device emmc,id=emmc,drive=d0,boot-partition-size=%u,"
++                        "rpmb-partition-size=%u%s "
 +                        "-drive if=none,id=d0,file=%s,format=raw",
-+                        BOOT_SIZE, RPMB_SIZE, s->path);
++                        BOOT_SIZE, RPMB_SIZE, cid_option, s->path);
 +    s->bus = qpci_new_pc(s->qts, NULL);
 +    s->dev = qpci_device_find(s->bus, QPCI_DEVFN(4, 0));
 +    g_assert_nonnull(s->dev);
@@ -334,6 +468,11 @@ Forwarded: no
 +    rpmb_read(s, frame, 1);
 +    g_assert_cmpuint(lduw_be_p(frame + FRAME_RESULT), ==, 0);
 +    emmc_select(s, 0);
++}
++
++static void emmc_init(EMMCTest *s)
++{
++    emmc_init_with_cid(s, NULL);
 +}
 +
 +static void emmc_cleanup(EMMCTest *s)
@@ -500,6 +639,135 @@ Forwarded: no
 +    emmc_cleanup(&s);
 +}
 +
++static void test_combined_reset(void)
++{
++    EMMCTest s = {};
++    uint8_t frame[FRAME_SIZE];
++
++    emmc_init(&s);
++    emmc_command(&s, 17, 0, true, 1, true);
++    g_assert_cmphex(qpci_io_readl(s.dev, s.bar, 0x24) & 2, !=, 0);
++    g_assert_cmphex(qpci_io_readw(s.dev, s.bar, 0x30) & 1, !=, 0);
++    /* Command and data reset bits can be requested together. */
++    qpci_io_writeb(s.dev, s.bar, 0x2f, 6);
++    g_assert_cmphex(qpci_io_readl(s.dev, s.bar, 0x24) & 2, ==, 0);
++    g_assert_cmphex(qpci_io_readw(s.dev, s.bar, 0x30) & 1, ==, 0);
++    emmc_command(&s, 17, 0, true, 1, true);
++    emmc_fifo(&s, frame, true);
++    for (unsigned i = 0; i < FRAME_SIZE; i++) {
++        g_assert_cmphex(frame[i], ==, 0x5a);
++    }
++    emmc_cleanup(&s);
++}
++
++static void test_unsupported_partition(void)
++{
++    EMMCTest s = {};
++    uint8_t frame[FRAME_SIZE];
++    uint32_t status;
++
++    emmc_init(&s);
++    for (unsigned part = 4; part <= 7; part++) {
++        status = emmc_command(&s, 6, 0x03b30000 | (part << 8),
++                              false, 0, false);
++        qtest_clock_step(s.qts, 1000000);
++        emmc_command(&s, 17, 0, true, 1, true);
++        emmc_fifo(&s, frame, true);
++        g_assert_cmphex(status & (1U << 7), !=, 0);
++        for (unsigned i = 0; i < FRAME_SIZE; i++) {
++            g_assert_cmphex(frame[i], ==, 0x5a);
++        }
++    }
++    emmc_cleanup(&s);
++}
++
++static void emmc_read_r2(EMMCTest *s, uint8_t response[16])
++{
++    /* SDHCI omits the CRC byte, as does Linux's raw_cid representation. */
++    for (unsigned i = 0; i < 4; i++) {
++        unsigned offset = 0x10 + (3 - i) * 4;
++        uint32_t word = qpci_io_readl(s->dev, s->bar, offset) << 8;
++
++        if (i != 3) {
++            word |= qpci_io_readb(s->dev, s->bar, offset - 1);
++        }
++        stl_be_p(response + i * 4, word);
++    }
++}
++
++static void test_cid(gconstpointer opaque)
++{
++    const char *cid = opaque;
++    const uint8_t default_cid[16] = {
++        0xaa, 0x01, 'X', 'Q', 'E', 'M', 'U', '!', '!', 0x01,
++        0xde, 0xad, 0xbe, 0xef, 0x29, 0x00,
++    };
++    EMMCTest s = {};
++    uint8_t expected[16], response[16];
++
++    memcpy(expected, default_cid, sizeof(expected));
++    if (cid) {
++        for (unsigned i = 0; i < 15; i++) {
++            expected[i] = (g_ascii_xdigit_value(cid[2 * i]) << 4) |
++                          g_ascii_xdigit_value(cid[2 * i + 1]);
++        }
++        expected[15] = 0;
++    }
++    emmc_init_with_cid(&s, cid);
++    for (unsigned round = 0; round < 2; round++) {
++        uint32_t ocr = 0;
++
++        if (round) {
++            qtest_system_reset(s.qts);
++            s.bar = qpci_iomap(s.dev, 0, NULL);
++            qpci_device_enable(s.dev);
++        }
++        qpci_io_writeb(s.dev, s.bar, 0x2f, 1);
++        qpci_io_writew(s.dev, s.bar, 0x2c, 7);
++        qpci_io_writeb(s.dev, s.bar, 0x29, 0x0f);
++        emmc_command(&s, 0, 0, false, 0, false);
++        for (unsigned i = 0; i < 100 && !(ocr & (1U << 31)); i++) {
++            ocr = emmc_command(&s, 1, 0x40ff8000, false, 0, false);
++            qtest_clock_step(s.qts, 1000000);
++        }
++        g_assert_cmphex(ocr & (1U << 31), !=, 0);
++        emmc_command(&s, 2, 0, false, 0, false);
++        emmc_read_r2(&s, response);
++        g_assert_cmpmem(response, sizeof(response), expected, sizeof(expected));
++        emmc_command(&s, 3, 1U << 16, false, 0, false);
++        emmc_command(&s, 10, 1U << 16, false, 0, false);
++        emmc_read_r2(&s, response);
++        g_assert_cmpmem(response, sizeof(response), expected, sizeof(expected));
++    }
++    if (cid) {
++        QDict *reply = qtest_qmp(s.qts,
++            "{'execute':'qom-get','arguments':{"
++            "'path':'/machine/peripheral/emmc','property':'cid'}}");
++
++        g_assert_cmpstr(qdict_get_str(reply, "return"), ==, cid);
++        qobject_unref(reply);
++    }
++    emmc_cleanup(&s);
++}
++
++static void test_invalid_cid(gconstpointer opaque)
++{
++    const char *cid = opaque;
++
++    if (g_test_subprocess()) {
++        QTestState *qts = qtest_initf("-machine pc -nodefaults "
++                                    "-device sdhci-pci,id=sdhci "
++                                    "-device 'emmc,cid=%s'", cid);
++
++        qtest_quit(qts);
++        return;
++    }
++    g_test_trap_subprocess(NULL, 10 * G_TIME_SPAN_SECOND, 0);
++    g_test_trap_assert_failed();
++    g_test_trap_assert_stderr("*eMMC cid must contain exactly 32 "
++                             "hexadecimal characters*");
++}
++
 +int main(int argc, char **argv)
 +{
 +    g_test_init(&argc, &argv, NULL);
@@ -508,11 +776,31 @@ Forwarded: no
 +    qtest_add_func("emmc/rpmb-write-bounds", test_rpmb_write_bounds);
 +    qtest_add_func("emmc/boot-bounds", test_boot_bounds);
 +    qtest_add_func("emmc/rpmb-requires-frames", test_rpmb_requires_frames);
++    qtest_add_func("emmc/combined-reset", test_combined_reset);
++    qtest_add_func("emmc/unsupported-partition", test_unsupported_partition);
++    qtest_add_data_func("emmc/cid/default", NULL, test_cid);
++    qtest_add_data_func("emmc/cid/custom", "15010043494431323310012345672900",
++                        test_cid);
++    qtest_add_data_func("emmc/cid/leading-zeroes",
++                        "00000aBc00000aBc00000aBc00000aBc", test_cid);
++    qtest_add_data_func("emmc/cid/invalid-empty", "", test_invalid_cid);
++    qtest_add_data_func("emmc/cid/invalid-short",
++                        "1501004349443132331001234567290", test_invalid_cid);
++    qtest_add_data_func("emmc/cid/invalid-long",
++                        "150100434944313233100123456729000", test_invalid_cid);
++    qtest_add_data_func("emmc/cid/invalid-hex",
++                        "1501004349443132331001234567290g", test_invalid_cid);
++    qtest_add_data_func("emmc/cid/invalid-prefix",
++                        "0x010043494431323310012345672900", test_invalid_cid);
++    qtest_add_data_func("emmc/cid/invalid-newline",
++                        "15010043494431323310012345672900\n", test_invalid_cid);
 +    return g_test_run();
 +}
+diff --git a/tests/qtest/meson.build b/tests/qtest/meson.build
+index 41495977bc..d95a8559bb 100644
 --- a/tests/qtest/meson.build
 +++ b/tests/qtest/meson.build
-@@ -93,7 +93,7 @@ qtests_i386 = \
+@@ -110,7 +110,7 @@ qtests_i386 = \
    (config_all_devices.has_key('CONFIG_VIRTIO_BALLOON') ? ['virtio-balloon-test'] : []) + \
    (config_all_devices.has_key('CONFIG_Q35') ? ['q35-test'] : []) +                          \
    (config_all_devices.has_key('CONFIG_SB16') ? ['fuzz-sb16-test'] : []) +                   \

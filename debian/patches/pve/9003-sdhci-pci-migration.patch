@@ -1,12 +1,10 @@
-Description: migrate the PCI configuration of SDHCI controllers
- Save the PCI command register and BAR mappings along with the existing SDHCI
- controller state. Otherwise a restored guest reads zero from the unmapped BAR
- and loses its eMMC device on the first I/O. Preserve the original controller
- layout when loading version 1 and append the missing PCI state in version 2.
- Add a migration regression that checks PCI configuration and controller MMIO
- without remapping or enabling the controller at the destination.
+Description: SDHCI PCI configuration migration
 Forwarded: no
+X-QEMU-Base-Commit: 60020476f524238c976c163b5bfcc9110676b7d4
+X-QEMU-Commit: b97c3add402c5e211d2257ffd92fedc9434241cb
 
+diff --git a/hw/sd/sdhci-pci.c b/hw/sd/sdhci-pci.c
+index 27001e5e1e..5ec0241ef3 100644
 --- a/hw/sd/sdhci-pci.c
 +++ b/hw/sd/sdhci-pci.c
 @@ -18,11 +18,29 @@
@@ -39,7 +37,7 @@ Forwarded: no
  static const Property sdhci_pci_properties[] = {
      DEFINE_SDHCI_COMMON_PROPERTIES(SDHCIState),
  };
-@@ -67,6 +85,7 @@ static void sdhci_pci_class_init(ObjectC
+@@ -67,6 +85,7 @@ static void sdhci_pci_class_init(ObjectClass *klass, const void *data)
      device_class_set_props(dc, sdhci_pci_properties);
  
      sdhci_common_class_init(klass, data);
@@ -47,9 +45,11 @@ Forwarded: no
  }
  
  static const TypeInfo sdhci_pci_types[] = {
+diff --git a/tests/qtest/sdhci-test.c b/tests/qtest/sdhci-test.c
+index 7b32711c8f..e7fce267f4 100644
 --- a/tests/qtest/sdhci-test.c
 +++ b/tests/qtest/sdhci-test.c
-@@ -103,9 +103,58 @@ static void test_registers(void *obj, vo
+@@ -103,9 +103,58 @@ static void test_registers(void *obj, void *data, QGuestAllocator *alloc)
      check_capab_baseclock(s, s->props.baseclock);
  }
  

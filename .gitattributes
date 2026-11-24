@@ -1,0 +1,2 @@
+# Generated patches carry literal diff context and nested firmware patches.
+debian/patches/pve/9[0-9][0-9][0-9]-*.patch text eol=lf whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab

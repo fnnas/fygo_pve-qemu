@@ -1,14 +1,84 @@
-Description: add configurable SD card identity and PCI SDHCI boot priority
- Expose an optional SD card CID while preserving the default identities, card
- protocol and migration state. Add per-controller bootindex for firmware boot
- ordering without changing the default response format. Cover card identity,
- capacity boundaries, I/O, reset and invalid configuration with native qtests.
- Document the card model, capacity limits and firmware compatibility.
+Description: SD card CID and PCI SDHCI boot priority
 Forwarded: no
+X-QEMU-Base-Commit: 2b1f1f125a13c4201cb93e4f1140e43251e4cbf2
+X-QEMU-Commit: 5686840d8cb17fe1d5b24d2e523b833364be5a13
 
+diff --git a/docs/system/device-emulation.rst b/docs/system/device-emulation.rst
+index 40054bb7df..4d44a932c3 100644
+--- a/docs/system/device-emulation.rst
++++ b/docs/system/device-emulation.rst
+@@ -89,6 +89,7 @@ Emulated Devices
+    devices/ccid.rst
+    devices/cxl.rst
+    devices/emmc.rst
++   devices/sdcard.rst
+    devices/igb.rst
+    devices/ivshmem-flat.rst
+    devices/ivshmem.rst
+diff --git a/docs/system/devices/sdcard.rst b/docs/system/devices/sdcard.rst
+new file mode 100644
+index 0000000000..82887fc800
+--- /dev/null
++++ b/docs/system/devices/sdcard.rst
+@@ -0,0 +1,53 @@
++SD cards
++========
++
++The ``sd-card`` device models an SD memory card on an SD bus. On PCI machines,
++attach each card to its own ``sdhci-pci`` controller. For example:
++
++.. code-block:: console
++
++    qemu-img create -f raw sd.img 8G
++    qemu-system-x86_64 -machine pc -m 512 \
++        -drive file=sd.img,format=raw,if=none,id=sd-image \
++        -device sdhci-pci,id=sdhci,sd-spec-version=2,bootindex=1 \
++        -device sd-card,drive=sd-image,bus=pci.0/sdhci/sd-bus
++
++Unlike eMMC, the card uses the whole image as its user area, without boot or
++RPMB partition offsets.
++
++The ``spec_version`` property accepts ``2`` (SD v2.00) or ``3`` (SD v3.01,
++the default). Capacity selects standard or high-capacity addressing. Images
++up to 2 GiB must have a power-of-two size; the smallest exactly representable
++capacity is 256 KiB. Larger images use 512 KiB units and the SDHC/SDXC CSD
++encoding represents at most 2 TiB. Create partition tables and filesystems
++inside the guest.
++
++The optional ``cid`` property accepts exactly 32 hexadecimal characters:
++
++.. code-block:: console
++
++    -device sd-card,drive=sd-image,cid=03534453443332478535bca2a70195df
++
++Omitting it retains the existing identity. A configured value is reapplied
++on reset, preserves all supplied bytes and does not modify the image. The
++existing CID migration state is unchanged; configure the same value and SD
++specification at both migration endpoints. A realized device's CID property
++cannot be changed.
++
++Standard SDHCI response registers omit the final CRC/end-bit byte. Linux
++therefore reports ``00`` for the last byte in
++``/sys/block/mmcblkN/device/cid`` with this controller, even if the configured
++CID ends differently. This is a controller/driver limitation, not a property
++of SD cards themselves.
++
++The optional ``sdhci-pci.bootindex`` property associates boot priority with
++that controller's card. It defaults to ``-1`` (no priority). Guest firmware
++must contain SD/MMC boot drivers and understand QEMU boot order. SeaBIOS and
++PVE's 4 MiB UEFI firmware support this configuration; older 2 MiB UEFI builds
++may not include the required drivers. This property does not alter the
++default controller model or its migration format.
++
++Adding or removing SD card devices, changing capacity or changing identity
++requires a cold restart of the virtual machine. SD bus devices are not
++hotpluggable. SD cards have no eMMC RPMB key/counter state; ordinary disk
++backup, snapshot and migration mechanisms apply.
+diff --git a/hw/sd/sd.c b/hw/sd/sd.c
+index 7738736704..00224ffc07 100644
 --- a/hw/sd/sd.c
 +++ b/hw/sd/sd.c
-@@ -461,8 +461,25 @@
+@@ -461,8 +461,25 @@ static void sd_set_scr(SDState *sd)
  #define MDT_YR  2006
  #define MDT_MON 2
  
@@ -34,7 +104,7 @@ Forwarded: no
      sd->cid[0] = MID;       /* Fake card manufacturer ID (MID) */
      sd->cid[1] = OID[0];    /* OEM/Application ID (OID) */
      sd->cid[2] = OID[1];
-@@ -481,12 +498,7 @@
+@@ -481,12 +498,7 @@ static void sd_set_cid(SDState *sd)
  
  static void emmc_set_cid(SDState *sd)
  {
@@ -48,7 +118,7 @@ Forwarded: no
          return;
      }
  
-@@ -3148,6 +3160,20 @@
+@@ -3148,6 +3160,20 @@ static void sd_realize(DeviceState *dev, Error **errp)
      int64_t blk_size = -ENOMEDIUM;
      int ret;
  
@@ -69,7 +139,7 @@ Forwarded: no
      switch (sd->spec_version) {
      case SD_PHY_SPECv2_00_VERS
       ... SD_PHY_SPECv3_01_VERS:
-@@ -3223,21 +3249,6 @@
+@@ -3223,21 +3249,6 @@ static void emmc_realize(DeviceState *dev, Error **errp)
  {
      SDState *sd = SDMMC_COMMON(dev);
  
@@ -91,7 +161,7 @@ Forwarded: no
      sd->spec_version = SD_PHY_SPECv3_01_VERS; /* Actually v4.5 */
  
      sd_realize(dev, errp);
-@@ -3248,6 +3259,7 @@
+@@ -3248,6 +3259,7 @@ static const Property sdmmc_common_properties[] = {
  };
  
  static const Property sd_properties[] = {
@@ -99,6 +169,8 @@ Forwarded: no
      DEFINE_PROP_UINT8("spec_version", SDState,
                        spec_version, SD_PHY_SPECv3_01_VERS),
  };
+diff --git a/hw/sd/sdhci-pci.c b/hw/sd/sdhci-pci.c
+index 5ec0241ef3..83625bc0c9 100644
 --- a/hw/sd/sdhci-pci.c
 +++ b/hw/sd/sdhci-pci.c
 @@ -18,6 +18,7 @@
@@ -109,7 +181,7 @@ Forwarded: no
  #include "migration/vmstate.h"
  #include "hw/core/irq.h"
  #include "hw/core/qdev-properties.h"
-@@ -72,6 +73,14 @@
+@@ -72,6 +73,14 @@ static void sdhci_pci_exit(PCIDevice *dev)
      sdhci_uninitfn(s);
  }
  
@@ -124,7 +196,7 @@ Forwarded: no
  static void sdhci_pci_class_init(ObjectClass *klass, const void *data)
  {
      DeviceClass *dc = DEVICE_CLASS(klass);
-@@ -94,6 +103,7 @@
+@@ -94,6 +103,7 @@ static const TypeInfo sdhci_pci_types[] = {
          .parent         = TYPE_PCI_DEVICE,
          .instance_size  = sizeof(SDHCIState),
          .class_init     = sdhci_pci_class_init,
@@ -132,9 +204,11 @@ Forwarded: no
          .interfaces     = (const InterfaceInfo[]) {
              { INTERFACE_CONVENTIONAL_PCI_DEVICE },
              { },
+diff --git a/include/hw/sd/sdhci.h b/include/hw/sd/sdhci.h
+index a9da6203fc..69c0bec0e5 100644
 --- a/include/hw/sd/sdhci.h
 +++ b/include/hw/sd/sdhci.h
-@@ -94,6 +94,7 @@
+@@ -94,6 +94,7 @@ struct SDHCIState {
      /* RO Host Controller Version Register always reads as 0x2401 */
  
      /* Configurable properties */
@@ -142,9 +216,11 @@ Forwarded: no
      bool pending_insert_quirk; /* Quirk for Raspberry Pi card insert int */
      uint32_t quirks;
      uint8_t sd_spec_version;
+diff --git a/tests/qtest/meson.build b/tests/qtest/meson.build
+index d95a8559bb..12d53e1bfe 100644
 --- a/tests/qtest/meson.build
 +++ b/tests/qtest/meson.build
-@@ -93,7 +93,7 @@
+@@ -110,7 +110,7 @@ qtests_i386 = \
    (config_all_devices.has_key('CONFIG_VIRTIO_BALLOON') ? ['virtio-balloon-test'] : []) + \
    (config_all_devices.has_key('CONFIG_Q35') ? ['q35-test'] : []) +                          \
    (config_all_devices.has_key('CONFIG_SB16') ? ['fuzz-sb16-test'] : []) +                   \
@@ -153,6 +229,9 @@ Forwarded: no
    (config_all_devices.has_key('CONFIG_ESP_PCI') ? ['am53c974-test'] : []) +                 \
    (config_all_devices.has_key('CONFIG_AMD_IOMMU') ? ['amd-iommu-test'] : []) +             \
    (config_all_devices.has_key('CONFIG_VTD') ? ['intel-iommu-test'] : []) +                 \
+diff --git a/tests/qtest/sdcard-test.c b/tests/qtest/sdcard-test.c
+new file mode 100644
+index 0000000000..d4f23d5f38
 --- /dev/null
 +++ b/tests/qtest/sdcard-test.c
 @@ -0,0 +1,234 @@
@@ -390,69 +469,3 @@ Forwarded: no
 +    }
 +    return g_test_run();
 +}
---- a/docs/system/device-emulation.rst
-+++ b/docs/system/device-emulation.rst
-@@ -89,6 +89,7 @@
-    devices/ccid.rst
-    devices/cxl.rst
-    devices/emmc.rst
-+   devices/sdcard.rst
-    devices/igb.rst
-    devices/ivshmem-flat.rst
-    devices/ivshmem.rst
---- /dev/null
-+++ b/docs/system/devices/sdcard.rst
-@@ -0,0 +1,53 @@
-+SD cards
-+========
-+
-+The ``sd-card`` device models an SD memory card on an SD bus. On PCI machines,
-+attach each card to its own ``sdhci-pci`` controller. For example:
-+
-+.. code-block:: console
-+
-+    qemu-img create -f raw sd.img 8G
-+    qemu-system-x86_64 -machine pc -m 512 \
-+        -drive file=sd.img,format=raw,if=none,id=sd-image \
-+        -device sdhci-pci,id=sdhci,sd-spec-version=2,bootindex=1 \
-+        -device sd-card,drive=sd-image,bus=pci.0/sdhci/sd-bus
-+
-+Unlike eMMC, the card uses the whole image as its user area, without boot or
-+RPMB partition offsets.
-+
-+The ``spec_version`` property accepts ``2`` (SD v2.00) or ``3`` (SD v3.01,
-+the default). Capacity selects standard or high-capacity addressing. Images
-+up to 2 GiB must have a power-of-two size; the smallest exactly representable
-+capacity is 256 KiB. Larger images use 512 KiB units and the SDHC/SDXC CSD
-+encoding represents at most 2 TiB. Create partition tables and filesystems
-+inside the guest.
-+
-+The optional ``cid`` property accepts exactly 32 hexadecimal characters:
-+
-+.. code-block:: console
-+
-+    -device sd-card,drive=sd-image,cid=03534453443332478535bca2a70195df
-+
-+Omitting it retains the existing identity. A configured value is reapplied
-+on reset, preserves all supplied bytes and does not modify the image. The
-+existing CID migration state is unchanged; configure the same value and SD
-+specification at both migration endpoints. A realized device's CID property
-+cannot be changed.
-+
-+Standard SDHCI response registers omit the final CRC/end-bit byte. Linux
-+therefore reports ``00`` for the last byte in
-+``/sys/block/mmcblkN/device/cid`` with this controller, even if the configured
-+CID ends differently. This is a controller/driver limitation, not a property
-+of SD cards themselves.
-+
-+The optional ``sdhci-pci.bootindex`` property associates boot priority with
-+that controller's card. It defaults to ``-1`` (no priority). Guest firmware
-+must contain SD/MMC boot drivers and understand QEMU boot order. SeaBIOS and
-+PVE's 4 MiB UEFI firmware support this configuration; older 2 MiB UEFI builds
-+may not include the required drivers. This property does not alter the
-+default controller model or its migration format.
-+
-+Adding or removing SD card devices, changing capacity or changing identity
-+requires a cold restart of the virtual machine. SD bus devices are not
-+hotpluggable. SD cards have no eMMC RPMB key/counter state; ordinary disk
-+backup, snapshot and migration mechanisms apply.
