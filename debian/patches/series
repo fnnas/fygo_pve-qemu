@@ -86,3 +86,4 @@ pve/9002-nvme-namespace-boot-and-discard.patch
 pve/9003-sdhci-pci-migration.patch
 pve/9004-emmc-partitions-and-cid.patch
 pve/9005-sd-card-cid-and-boot-order.patch
+pve/9006-usb4-dock-nvme-hotplug.patch

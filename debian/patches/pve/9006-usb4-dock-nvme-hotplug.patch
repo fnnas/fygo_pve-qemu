@@ -1,0 +1,400 @@
+Description: Keep a USB4 dock attached while toggling its NVMe namespace
+Forwarded: no
+X-QEMU-Base-Commit: 5686840d8cb17fe1d5b24d2e523b833364be5a13
+X-QEMU-Commit: 71f8fdfb19b628b4b45b57fc0d978c6b4651a3c1
+
+diff --git a/hw/usb4/usb4-device.c b/hw/usb4/usb4-device.c
+index fac12a53b6..177535c3a3 100644
+--- a/hw/usb4/usb4-device.c
++++ b/hw/usb4/usb4-device.c
+@@ -67,6 +67,8 @@ struct USB4Device {
+     char *dialect_str;      /* "usb4" or "tb3" */
+     char *drive;            /* -drive / -blockdev id for the NVMe */
+     char *serial;
++    bool dock_nvme_hotplug;
++    bool nvme_disconnected;
+     char *nvme_namespaces;  /* "nsid:drive[;...]", docs/HARNESS.md */
+     uint32_t nvme_nn;       /* NVMe Identify NN (0: default) */
+     char *vendor_name;      /* DROM strings */
+@@ -141,6 +143,16 @@ const char *usb4_device_nvme_drive(USB4Device *d)
+     return d->drive;
+ }
+ 
++bool usb4_device_dock_nvme_hotplug(USB4Device *d)
++{
++    return d->dock_nvme_hotplug;
++}
++
++bool usb4_device_nvme_disconnected(USB4Device *d)
++{
++    return d->nvme_disconnected;
++}
++
+ const char *usb4_device_nvme_serial(USB4Device *d)
+ {
+     return d->serial;
+@@ -443,6 +455,17 @@ static void usb4_device_realize(DeviceState *dev, Error **errp)
+                    "dialect=usb4, downstream-ports=0 and dock=off");
+         return;
+     }
++    if (d->dock_nvme_hotplug &&
++        (!d->dock || !d->drive || !*d->drive || d->nvme_namespaces)) {
++        error_setg(errp, "usb4-device: x-dock-nvme-hotplug needs a dock with "
++                   "drive= and no explicit namespace layout");
++        return;
++    }
++    if (d->nvme_disconnected && !d->dock_nvme_hotplug) {
++        error_setg(errp, "usb4-device: x-nvme-disconnected needs "
++                   "x-dock-nvme-hotplug");
++        return;
++    }
+     if (d->usb3_devs && *d->usb3_devs) {
+         /*
+          * A USB3 tunnel needs a USB3 Gen X Upstream adapter here and a
+@@ -574,6 +597,8 @@ static const Property usb4_device_properties[] = {
+     /* A string on purpose: DEFINE_PROP_DRIVE would attach the backend. */
+     DEFINE_PROP_STRING("drive", USB4Device, drive),
+     DEFINE_PROP_STRING("serial", USB4Device, serial),
++    DEFINE_PROP_BOOL("x-dock-nvme-hotplug", USB4Device, dock_nvme_hotplug,
++                     false),
+     DEFINE_PROP_STRING("nvme-namespaces", USB4Device, nvme_namespaces),
+     DEFINE_PROP_UINT32("nvme-nn", USB4Device, nvme_nn, 0),
+     DEFINE_PROP_STRING("vendor-name", USB4Device, vendor_name),
+@@ -696,10 +721,50 @@ static char *usb4_device_get_usb3(Object *obj, Error **errp)
+                            d->usb3_ups, d->usb3_downs, att);
+ }
+ 
++static bool usb4_device_get_nvme_disconnected(Object *obj, Error **errp)
++{
++    return USB4_DEVICE(obj)->nvme_disconnected;
++}
++
++static void usb4_device_set_nvme_disconnected(Object *obj, bool disconnected,
++                                             Error **errp)
++{
++    USB4Device *d = USB4_DEVICE(obj);
++    USB4TunnelPort *port;
++
++    if (!DEVICE(d)->realized) {
++        d->nvme_disconnected = disconnected;
++        return;
++    }
++    if (!d->dock_nvme_hotplug) {
++        error_setg(errp, "The dock was started without x-dock-nvme-hotplug");
++        return;
++    }
++    if (d->nvme_disconnected == disconnected) {
++        return;
++    }
++    if (d->parent_dev) {
++        port = d->parent_dev->dfp_target[d->port];
++    } else {
++        port = d->parent ? NULL :
++               usb4_host_get_port_tunnel(d->host, d->port);
++    }
++    if (!usb4_tunnel_port_set_dock_nvme(port, d, disconnected, errp)) {
++        return;
++    }
++    d->nvme_disconnected = disconnected;
++}
++
+ static void usb4_device_class_init(ObjectClass *klass, const void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(klass);
+ 
++    object_class_property_add_bool(klass, "x-nvme-disconnected",
++                                   usb4_device_get_nvme_disconnected,
++                                   usb4_device_set_nvme_disconnected);
++    object_class_property_set_description(klass, "x-nvme-disconnected",
++        "Disconnect only the dock's NVMe namespace, retaining the backend "
++        "and the other dock devices");
+     object_class_property_add_bool(klass, "x-attached",
+                                    usb4_device_get_attached, NULL);
+     object_class_property_add_str(klass, "x-pcie-down",
+diff --git a/hw/usb4/usb4-internal.h b/hw/usb4/usb4-internal.h
+index 6f90b467f5..5228ec66e6 100644
+--- a/hw/usb4/usb4-internal.h
++++ b/hw/usb4/usb4-internal.h
+@@ -358,6 +358,8 @@ void usb4_tunnel_retrain_recheck(void);
+  * attachment life the reset began.
+  */
+ void usb4_tunnel_port_reattach(USB4TunnelPort *p, USB4Device *dev);
++bool usb4_tunnel_port_set_dock_nvme(USB4TunnelPort *p, USB4Device *dev,
++                                   bool disconnected, Error **errp);
+ void usb4_tunnel_port_set_state(USB4TunnelPort *p, USB4Device *dev,
+                                 USB4TunnelState st, USB4TunnelReason why);
+ 
+@@ -431,6 +433,8 @@ bool usb4_fabric_cfg_write(USB4Fabric *f, uint64_t route, unsigned cs,
+ /* Accessors the fabric uses on a device router object. */
+ USB4Dialect usb4_device_dialect(USB4Device *d);
+ const char *usb4_device_nvme_drive(USB4Device *d);  /* blockdev id */
++bool usb4_device_dock_nvme_hotplug(USB4Device *d);
++bool usb4_device_nvme_disconnected(USB4Device *d);
+ const char *usb4_device_nvme_serial(USB4Device *d);
+ /* nvme-ns layout "nsid:drive[;...]" and Identify NN (docs/HARNESS.md) */
+ const char *usb4_device_nvme_namespaces(USB4Device *d);
+diff --git a/hw/usb4/usb4-tunnel-slot.c b/hw/usb4/usb4-tunnel-slot.c
+index cd16a51be8..88883827aa 100644
+--- a/hw/usb4/usb4-tunnel-slot.c
++++ b/hw/usb4/usb4-tunnel-slot.c
+@@ -623,6 +623,10 @@ static uint32_t ts_eff_nn(USB4TunnelSlot *ts);
+  * covers subordinate buses (pci_bus_access_gated()); the switch's
+  * windows nest inside the tunnel bridge's, which the gate disables.
+  */
++static bool ts_create_dock_namespace(USB4TunnelSlot *ts, DeviceState *nvme,
++                                     const char *drive, bool hotplugged,
++                                     Error **errp);
++
+ static bool ts_build_switch(USB4TunnelSlot *ts, DeviceState *up,
+                             const char *pfx, const char *drive,
+                             const char *serial, bool cold, Error **errp)
+@@ -670,7 +674,7 @@ static bool ts_build_switch(USB4TunnelSlot *ts, DeviceState *up,
+             return false;
+         }
+         if (i == 0) {
+-            ok = (!drive || !*drive ||
++            ok = (ts->up_dock_nvme_hotplug || !drive || !*drive ||
+                   object_property_set_str(OBJECT(ep), "drive", drive,
+                                           errp)) &&
+                  object_property_set_str(OBJECT(ep), "serial",
+@@ -699,6 +703,10 @@ static bool ts_build_switch(USB4TunnelSlot *ts, DeviceState *up,
+         }
+         if (i == 0) {
+             usb4_harness_attach(ts, PCI_DEVICE(ep));
++            if (ts->up_dock_nvme_hotplug && !ts->up_nvme_disconnected &&
++                !ts_create_dock_namespace(ts, ep, drive, !cold, errp)) {
++                return false;
++            }
+         }
+         if (i == 2) {
+             xhci = ep;
+@@ -839,6 +847,9 @@ char *usb4_tunnel_slot_identity(USB4TunnelSlot *ts)
+     const char *serial = ts_eff_serial(ts);
+     const char *ns = ts_eff_namespaces(ts);
+ 
++    if (ts->up_dock_nvme_hotplug && ts->up_nvme_disconnected) {
++        drive = NULL;
++    }
+     return g_strdup_printf("dev=%s;drive=%s;serial=%s;ns=%s;nn=%u;dock=%d;"
+                            "asm2464=%d;nic=%s;usb=%s;ndfp=%u",
+                            ts->up_dev_path ? ts->up_dev_path : "",
+@@ -938,7 +949,7 @@ static bool ts_ns_check(const char *spec, const char *ep_drive, uint32_t nn,
+  * endpoint is removed (ts_ns_release()).
+  */
+ static bool ts_ns_create(USB4TunnelSlot *ts, const char *spec,
+-                         DeviceState *dev, Error **errp)
++                         DeviceState *dev, bool hotplugged, Error **errp)
+ {
+     g_auto(GStrv) items = NULL;
+     const char *bid = DEVICE(ts->bridge)->id;
+@@ -966,7 +977,7 @@ static bool ts_ns_create(USB4TunnelSlot *ts, const char *spec,
+             object_unref(OBJECT(ns));
+             return false;
+         }
+-        ns->hotplugged = false;
++        ns->hotplugged = hotplugged;
+         if (!object_property_set_str(OBJECT(ns), "drive", kv[1], errp) ||
+             !object_property_set_uint(OBJECT(ns), "nsid", nsid, errp)) {
+             ts_drop_dev(ns);
+@@ -984,6 +995,15 @@ static bool ts_ns_create(USB4TunnelSlot *ts, const char *spec,
+     return true;
+ }
+ 
++static bool ts_create_dock_namespace(USB4TunnelSlot *ts, DeviceState *nvme,
++                                     const char *drive, bool hotplugged,
++                                     Error **errp)
++{
++    g_autofree char *spec = g_strdup_printf("1:%s", drive);
++
++    return ts_ns_create(ts, spec, nvme, hotplugged, errp);
++}
++
+ /* A drive of the layout is still held by an old endpoint namespace. */
+ static bool ts_ns_busy(const char *spec)
+ {
+@@ -1067,7 +1087,7 @@ static TsInsertResult ts_insert(USB4TunnelSlot *ts, bool cold)
+      * is announced, so wait for them to be free before inserting it (the
+      * caller retries); a single NVMe simply fails its realize instead.
+      */
+-    if (sw && (ts_drive_busy(drive) ||
++    if (sw && ((!ts->up_nvme_disconnected && ts_drive_busy(drive)) ||
+                (dock && ts_drive_busy(ts->up_usb_drive)))) {
+         trace_usb4_tp_insert_failed(name, "dock drive still in use");
+         ts->next_gen--;
+@@ -1124,7 +1144,7 @@ static TsInsertResult ts_insert(USB4TunnelSlot *ts, bool cold)
+     }
+     if (!sw) {
+         usb4_harness_attach(ts, PCI_DEVICE(dev));
+-        if (!ts_ns_create(ts, ns_spec, dev, &err)) {
++        if (!ts_ns_create(ts, ns_spec, dev, false, &err)) {
+             /*
+              * Validated, and still failed (e.g. the image does not suit
+              * an nvme-ns). The endpoint is plugged: take it away again
+@@ -1481,6 +1501,8 @@ static void ts_take_device(USB4TunnelSlot *ts, USB4Device *dev)
+     g_free(ts->up_nic_netdev);
+     g_free(ts->up_usb_drive);
+     ts->up_dock = usb4_device_dock(dev);
++    ts->up_dock_nvme_hotplug = usb4_device_dock_nvme_hotplug(dev);
++    ts->up_nvme_disconnected = usb4_device_nvme_disconnected(dev);
+     /*
+      * The ASM2464's PCIe switch needs a PCIe tunnel port; on the i440FX
+      * tunnel bridge the NVMe sits directly behind the bridge as for any
+@@ -1871,6 +1893,57 @@ void usb4_tunnel_port_power_domain(USB4TunnelPort *p, bool powered)
+     ts_tunnel_gate(ts, !powered);
+ }
+ 
++bool usb4_tunnel_port_set_dock_nvme(USB4TunnelPort *p, USB4Device *dev,
++                                   bool disconnected, Error **errp)
++{
++    USB4TunnelSlot *ts = p ? ts_from_object(OBJECT(p)) : NULL;
++    g_autofree char *path = object_get_canonical_path(OBJECT(dev));
++    PCIDevice *downstream, *nvme;
++    Error *local_err = NULL;
++
++    if (!ts || !ts_alive(ts) || ts->ep_state != EP_LIVE ||
++        !ts->tunnel_up || !ts->up_dock_nvme_hotplug ||
++        !ts_builds_switch(ts) ||
++        g_strcmp0(path, ts->up_dev_path)) {
++        error_setg(errp, "The dock's PCIe tunnel is not ready");
++        return false;
++    }
++    downstream = pci_bridge_get_sec_bus(PCI_BRIDGE(ts->ep))->devices[0];
++    nvme = downstream ?
++           pci_bridge_get_sec_bus(PCI_BRIDGE(downstream))->devices[0] : NULL;
++    if (!nvme) {
++        error_setg(errp, "The dock's NVMe controller is not present");
++        return false;
++    }
++    if (!usb4_tunnel_slot_lifecycle_begin(ts)) {
++        error_setg(errp, "The dock is busy changing its PCIe tunnel");
++        return false;
++    }
++    if (disconnected && ts->ns_devs->len) {
++        DeviceState *ns = g_ptr_array_index(ts->ns_devs, 0);
++
++        if (ns->realized) {
++            qdev_unplug(ns, &local_err);
++        }
++        if (!local_err && ts_alive(ts) &&
++            g_ptr_array_remove_fast(ts->ns_devs, ns)) {
++            object_unref(OBJECT(ns));
++        }
++    } else if (!disconnected) {
++        ts_create_dock_namespace(ts, DEVICE(nvme), ts->up_drive, true,
++                                 &local_err);
++    }
++    if (!local_err) {
++        ts->up_nvme_disconnected = disconnected;
++    }
++    usb4_tunnel_slot_lifecycle_end(ts);
++    if (local_err) {
++        error_propagate(errp, local_err);
++        return false;
++    }
++    return true;
++}
++
+ bool usb4_tunnel_port_power_cycling(USB4TunnelPort *p)
+ {
+     USB4TunnelSlot *ts = p ? ts_from_object(OBJECT(p)) : NULL;
+diff --git a/hw/usb4/usb4-tunnel-slot.h b/hw/usb4/usb4-tunnel-slot.h
+index 1686dfde70..d3832fb853 100644
+--- a/hw/usb4/usb4-tunnel-slot.h
++++ b/hw/usb4/usb4-tunnel-slot.h
+@@ -143,6 +143,8 @@ struct USB4TunnelSlot {
+     char *up_namespaces;
+     uint32_t up_nn;
+     bool up_dock;               /* insert a dock, not a single NVMe */
++    bool up_dock_nvme_hotplug;
++    bool up_nvme_disconnected;
+     bool up_asm2464;            /* the ASM2464's switch, then the NVMe */
+     char *up_nic_netdev;
+     char *up_usb_drive;
+diff --git a/tests/qtest/usb4-tunnel-test.c b/tests/qtest/usb4-tunnel-test.c
+index 24a3937518..ff01aceca4 100644
+--- a/tests/qtest/usb4-tunnel-test.c
++++ b/tests/qtest/usb4-tunnel-test.c
+@@ -9,6 +9,7 @@
+ #include "qemu/osdep.h"
+ #include "libqtest.h"
+ #include "qobject/qdict.h"
++#include "qobject/qlist.h"
+ 
+ #define TP_PATH "/machine/peripheral/tp0"
+ #define TP_DEVFN (3 << 3)
+@@ -1197,6 +1198,66 @@ static void dock_check_tree(QTestState *qts)
+     }
+ }
+ 
++static void assert_dock_namespace(QTestState *qts, bool present)
++{
++    /* The removed namespace can retain its backend until RCU finalization. */
++    for (int i = 0; i < 200; i++) {
++        g_autoptr(QDict) rsp = qtest_qmp(qts, "{'execute': 'query-block'}");
++        QList *blocks = qdict_get_qlist(rsp, "return");
++        const QListEntry *entry;
++        bool found = false;
++
++        QLIST_FOREACH_ENTRY(blocks, entry) {
++            QDict *block = qobject_to(QDict, qlist_entry_obj(entry));
++            QDict *inserted = qdict_get_qdict(block, "inserted");
++
++            if (inserted &&
++                !g_strcmp0(qdict_get_try_str(inserted, "node-name"),
++                           "disk0") &&
++                qdict_haskey(block, "qdev")) {
++                found = true;
++            }
++        }
++        if (found == present) {
++            return;
++        }
++        g_usleep(1000);
++    }
++    g_error("Dock NVMe namespace did not become %s",
++            present ? "attached" : "detached");
++}
++
++static void test_dock_nvme_connection(void)
++{
++    QTestState *qts = qtest_init(
++        "-machine q35 "
++        "-blockdev driver=null-co,node-name=disk0,size=16777216 "
++        "-device usb4-tunnel-port,id=tp0,bus=pcie.0,addr=0x3,chassis=1 "
++        "-device usb4-host,id=u4,bus=pcie.0,addr=0x4,tunnel-port=tp0,"
++        "preos-cm=on "
++        "-device usb4-device,id=dock0,bus=u4.0,dock=on,drive=disk0,"
++        "x-dock-nvme-hotplug=on,x-nvme-disconnected=on");
++    g_autoptr(QDict) before = qtest_qmp(qts, "{'execute': 'query-pci'}");
++    g_autoptr(QDict) after = NULL;
++
++    assert_dock_namespace(qts, false);
++    for (int i = 0; i < 2; i++) {
++        qtest_qmp_assert_success(
++            qts, "{'execute': 'qom-set', 'arguments': "
++            "{'path': 'dock0', 'property': 'x-nvme-disconnected', "
++            "'value': false}}");
++        assert_dock_namespace(qts, true);
++        qtest_qmp_assert_success(
++            qts, "{'execute': 'qom-set', 'arguments': "
++            "{'path': 'dock0', 'property': 'x-nvme-disconnected', "
++            "'value': true}}");
++        assert_dock_namespace(qts, false);
++    }
++    after = qtest_qmp(qts, "{'execute': 'query-pci'}");
++    g_assert_true(qobject_is_equal(QOBJECT(before), QOBJECT(after)));
++    qtest_quit(qts);
++}
++
+ static void test_dock(void)
+ {
+     g_autofree char *img = make_img();
+@@ -2130,6 +2191,8 @@ int main(int argc, char **argv)
+     qtest_add_func("/usb4-tunnel-bridge/disable-deferred",
+                    test_bridge_disable_deferred);
+     qtest_add_func("/usb4-tunnel-port/dock", test_dock);
++    qtest_add_func("/usb4-tunnel-port/dock-nvme-connection",
++                   test_dock_nvme_connection);
+     qtest_add_func("/usb4-tunnel-port/window-all-ones",
+                    test_window_all_ones);
+     qtest_add_func("/usb4-tunnel-bridge/window-all-ones",
